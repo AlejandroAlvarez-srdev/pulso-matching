@@ -33,6 +33,11 @@ packages = ["src/pulso_matching"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+filterwarnings = [
+    "error",
+    # Starlette 1.x nudges TestClient users towards httpx2; httpx 0.28 is still supported.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
 
 [tool.ruff]
 line-length = 100
