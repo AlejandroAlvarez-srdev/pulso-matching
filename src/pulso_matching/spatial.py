@@ -60,11 +60,17 @@ class GridIndex[T]:
     def __len__(self) -> int:
         return self._size
 
+    # Inserts and queries must bucket a coordinate identically. ``x // c`` and ``floor(x / c)``
+    # can disagree by one for floats (180 // 2.4324... == 73 but floor(180 / 2.4324...) == 74),
+    # so every cell index goes through these two helpers.
     def _row(self, lat: float) -> int:
-        return min(int((lat + 90.0) // self._cell_lat), self._n_rows - 1)
+        return min(math.floor((lat + 90.0) / self._cell_lat), self._n_rows - 1)
+
+    def _unwrapped_col(self, lng: float) -> int:
+        return math.floor((lng + 180.0) / self._cell_lng)
 
     def _col(self, lng: float) -> int:
-        return int((lng + 180.0) // self._cell_lng) % self._n_cols
+        return self._unwrapped_col(lng) % self._n_cols
 
     def insert(self, item: T, lat: float, lng: float) -> None:
         """O(1) amortised."""
@@ -84,8 +90,8 @@ class GridIndex[T]:
         if dlng >= 180.0:
             cols: set[int] | None = None  # every column
         else:
-            start = math.floor((lng - dlng + 180.0) / self._cell_lng)
-            stop = math.floor((lng + dlng + 180.0) / self._cell_lng)
+            start = self._unwrapped_col(lng - dlng)
+            stop = self._unwrapped_col(lng + dlng)
             cols = (
                 None
                 if stop - start + 1 >= self._n_cols

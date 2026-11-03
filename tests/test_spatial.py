@@ -131,6 +131,13 @@ def test_every_longitude_meets_at_the_pole(pole: float) -> None:
     assert len(index.query(pole, 77.0, 0.001)) == len(pts)
 
 
+def test_insert_and_query_bucket_cell_boundaries_identically() -> None:
+    # Regression (found by Hypothesis): with 271 km cells, lng 0 sits exactly on a column
+    # boundary and the insert used ``//`` while the query used ``floor(/)``, one column apart.
+    index = build([(-89.999, 0.0)], cell_km=271.0)
+    assert [i for i, _ in index.query(-89.999, 0.0, 0.0)] == [0]
+
+
 def test_zero_radius_returns_only_coincident_points() -> None:
     index = build([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0001)], cell_km=1)
     assert {i for i, _ in index.query(1.0, 1.0, 0.0)} == {0, 1}
