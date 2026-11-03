@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from pulso_matching.config import Settings, get_settings
 from pulso_matching.examples import BATCH_EXAMPLES, MATCH_EXAMPLES
 from pulso_matching.main import app, get_service
+from pulso_matching.metrics import REGISTRY
 from pulso_matching.problems import PROBLEM_JSON
 from pulso_matching.scoring import Scorer
 from pulso_matching.service import BatchResult, MatchingService
@@ -244,3 +245,72 @@ def test_slow_request_returns_504_problem(client: TestClient) -> None:
     assert res.status_code == 504
     assert res.headers["content-type"] == PROBLEM_JSON
     assert res.json()["type"].endswith("/timeout")
+
+
+def _sample(name: str, **labels: str) -> float:
+    return REGISTRY.get_sample_value(name, labels) or 0.0
+
+
+def test_metrics_endpoint_exposes_prometheus_text(client: TestClient) -> None:
+    client.get("/health")
+    res = client.get("/metrics")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/plain")
+    for name in (
+        "pulso_http_request_duration_seconds_bucket",
+        "pulso_assignments_total",
+        "pulso_unassigned_orders_total",
+    ):
+        assert name in res.text
+
+
+def test_metrics_count_assignments_unassigned_and_latency(client: TestClient) -> None:
+    before = {
+        "assigned": _sample("pulso_assignments_total", strategy="greedy"),
+        "unassigned": _sample("pulso_unassigned_orders_total", strategy="greedy"),
+        "requests": _sample(
+            "pulso_http_request_duration_seconds_count",
+            method="POST",
+            route="/match/batch",
+            status="200",
+        ),
+        "not_found": _sample(
+            "pulso_http_request_duration_seconds_count",
+            method="GET",
+            route="unmatched",
+            status="404",
+        ),
+    }
+    res = client.post(
+        "/match/batch",
+        json={"orders": [order(0), order(40)], "pulsers": [pulser("p")], "strategy": "greedy"},
+    )
+    assert res.status_code == 200
+    client.get("/does-not-exist")
+    assert _sample("pulso_assignments_total", strategy="greedy") == before["assigned"] + 1
+    assert _sample("pulso_unassigned_orders_total", strategy="greedy") == before["unassigned"] + 1
+    assert (
+        _sample(
+            "pulso_http_request_duration_seconds_count",
+            method="POST",
+            route="/match/batch",
+            status="200",
+        )
+        == before["requests"] + 1
+    )
+    assert (
+        _sample(
+            "pulso_http_request_duration_seconds_count",
+            method="GET",
+            route="unmatched",
+            status="404",
+        )
+        == before["not_found"] + 1
+    )
+
+
+def test_degraded_batches_are_counted(client: TestClient) -> None:
+    before = _sample("pulso_degraded_batches_total")
+    app.dependency_overrides[get_settings] = lambda: Settings(hungarian_budget_ms=1e-9)
+    client.post("/match/batch", json={"orders": [order()], "pulsers": [pulser("p")]})
+    assert _sample("pulso_degraded_batches_total") == before + 1

@@ -9,8 +9,9 @@ from typing import Annotated
 
 import structlog
 from fastapi import Body, Depends, FastAPI, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from pulso_matching import __version__
+from pulso_matching import __version__, metrics
 from pulso_matching.config import Settings, get_settings
 from pulso_matching.examples import BATCH_EXAMPLES, MATCH_EXAMPLES
 from pulso_matching.logging_config import configure_logging
@@ -61,6 +62,12 @@ def create_app() -> FastAPI:
         finally:
             structlog.contextvars.clear_contextvars()
         response.headers["x-request-id"] = request_id
+        route = request.scope.get("route")
+        metrics.REQUEST_LATENCY.labels(
+            method=request.method,
+            route=getattr(route, "path", "unmatched"),
+            status=str(response.status_code),
+        ).observe(time.perf_counter() - started)
         log.info(
             "http.request",
             request_id=request_id,
@@ -70,6 +77,10 @@ def create_app() -> FastAPI:
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
         )
         return response
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus_metrics() -> Response:
+        return Response(generate_latest(metrics.REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -114,6 +125,13 @@ def create_app() -> FastAPI:
             lambda: service.assign_batch(body.orders, body.pulsers, body.strategy, deadline),
             settings.request_timeout_ms,
         )
+        metrics.BATCH_SIZE.observe(len(body.orders))
+        metrics.ASSIGNMENTS.labels(strategy=body.strategy.value).inc(len(result.assignments))
+        metrics.UNASSIGNED.labels(strategy=body.strategy.value).inc(
+            len(result.unassigned_order_ids)
+        )
+        if result.degraded:
+            metrics.DEGRADED_BATCHES.inc()
         return BatchMatchResponse(
             strategy=body.strategy,
             assignments=result.assignments,

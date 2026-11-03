@@ -8,6 +8,7 @@ h11==0.16.0
 idna==3.20
 numpy==2.5.4
 opentelemetry-api==1.45.2
+prometheus_client==0.26.0
 pydantic-settings==2.16.2
 pydantic==2.14.2
 pydantic_core==2.50.2
