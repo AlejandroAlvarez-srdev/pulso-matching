@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pulso-matching"
+version = "0.1.0"
+description = "Order-to-pulser matching service: weighted scoring, Hungarian assignment and a spatial grid index."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Alejandro Álvarez" }]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.162.0",
+    "pydantic==2.14.2",
+    "pydantic-settings==2.16.2",
+    "structlog==26.1.0",
+    "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx==0.28.1",
+    "hypothesis==6.170.14",
+    "mypy==2.4.1",
+    "pytest==9.2.0",
+    "ruff==0.17.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pulso_matching"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "N", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["src", "tests", "benchmarks"]
