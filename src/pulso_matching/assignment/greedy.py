@@ -18,16 +18,27 @@ from __future__ import annotations
 
 import heapq
 
-from pulso_matching.assignment.types import CostMatrix, Pairs
+import numpy as np
+
+from pulso_matching.assignment.types import CostMatrix, FloatMatrix, Pairs
 
 
-def greedy_assignment(cost: CostMatrix) -> Pairs:
-    """Heap-based greedy assignment; see the module docstring for Big-O."""
-    heap = [(c, i, j) for i, row in enumerate(cost) for j, c in enumerate(row) if c is not None]
+def greedy_assignment(cost: CostMatrix | FloatMatrix) -> Pairs:
+    """Heap-based greedy assignment; see the module docstring for Big-O.
+
+    Accepts a ``None``-sparse matrix or a float ndarray with ``inf``/``nan`` as infeasible.
+    """
+    heap: list[tuple[float, int, int]]
+    if isinstance(cost, np.ndarray):
+        ii, jj = np.nonzero(np.isfinite(cost))
+        heap = list(zip(cost[ii, jj].tolist(), ii.tolist(), jj.tolist(), strict=True))
+        n, m = cost.shape if cost.ndim == 2 else (0, 0)
+    else:
+        heap = [(c, i, j) for i, row in enumerate(cost) for j, c in enumerate(row) if c is not None]
+        n = len(cost)
+        m = max((len(row) for row in cost), default=0)
     heapq.heapify(heap)
 
-    n = len(cost)
-    m = max((len(row) for row in cost), default=0)
     target = min(n, m)
     used_rows: set[int] = set()
     used_cols: set[int] = set()

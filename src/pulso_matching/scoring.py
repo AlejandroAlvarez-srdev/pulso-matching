@@ -3,11 +3,19 @@
 Every component is normalised to ``[0, 1]`` where 0 is best, then combined with the configured
 weights into a **cost** in ``[0, 1]``. The public **score** is ``1 - cost`` (higher is better).
 Assignment algorithms minimise cost; the API reports score.
+
+The cost splits into a part that depends only on the pair (distance, rating, travel time) and a
+part that depends on the batch slot (load, stacking delay). :class:`PairTerms` caches the first
+part, so the expensive bit — haversine — is computed once per pair and reused for every slot,
+every component matrix and any fallback re-solve.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+import numpy as np
+from numpy.typing import NDArray
 
 from pulso_matching.config import Settings
 from pulso_matching.geo import haversine_km
@@ -23,6 +31,15 @@ class PairScore:
     @property
     def score(self) -> float:
         return 1.0 - self.cost
+
+
+@dataclass(frozen=True, slots=True)
+class PairTerms:
+    """Slot-independent part of a pair's cost, computed once per (order, pulser)."""
+
+    distance_km: float
+    base_eta_minutes: float
+    static_cost: float  # weighted distance + rating terms
 
 
 class Scorer:
@@ -65,13 +82,49 @@ class Scorer:
         free = pulser.max_tasks - pulser.active_tasks
         return min(free, self._s.max_orders_per_pulser_per_batch)
 
-    def score(self, order: Order, pulser: Pulser, slot: int = 0) -> PairScore | None:
-        """Return the pair score, or ``None`` if the pulser cannot take the order.
+    def terms(self, pulser: Pulser, distance_km: float) -> PairTerms:
+        return PairTerms(
+            distance_km=distance_km,
+            base_eta_minutes=self.eta_minutes(distance_km, pulser.vehicle),
+            static_cost=self._w_distance * (distance_km / self._s.max_radius_km)
+            + self._w_rating * (1.0 - pulser.rating / 5.0),
+        )
 
-        ``slot`` is the number of orders already stacked on this pulser in the current batch:
-        it raises the load term to ``(activeTasks + slot) / maxTasks`` and delays the ETA by
-        ``slot · stacked_order_delay_minutes`` (they finish the earlier ones first).
+    def slot_score(self, terms: PairTerms, pulser: Pulser, slot: int) -> PairScore | None:
+        """Full score of a cached pair when it is the pulser's ``slot``-th order in the batch.
+
+        ``slot`` raises the load term to ``(activeTasks + slot) / maxTasks`` and delays the ETA
+        by ``slot · stacked_order_delay_minutes`` (they finish the earlier ones first).
         """
+        if not pulser.online or pulser.active_tasks + slot >= pulser.max_tasks:
+            return None
+        eta = terms.base_eta_minutes + slot * self._s.stacked_order_delay_minutes
+        cost = (
+            terms.static_cost
+            + self._w_eta * min(eta / self._s.max_eta_minutes, 1.0)
+            + self._w_load * ((pulser.active_tasks + slot) / pulser.max_tasks)
+        )
+        return PairScore(cost=cost, distance_km=terms.distance_km, eta_minutes=eta)
+
+    def slot_costs(
+        self,
+        static_cost: NDArray[np.float64],
+        base_eta: NDArray[np.float64],
+        active_tasks: NDArray[np.float64],
+        max_tasks: NDArray[np.float64],
+        slot: int,
+    ) -> NDArray[np.float64]:
+        """Vectorised :meth:`slot_score` cost for many cached pairs at the same slot."""
+        eta = base_eta + slot * self._s.stacked_order_delay_minutes
+        result: NDArray[np.float64] = (
+            static_cost
+            + self._w_eta * np.minimum(eta / self._s.max_eta_minutes, 1.0)
+            + self._w_load * ((active_tasks + slot) / max_tasks)
+        )
+        return result
+
+    def score(self, order: Order, pulser: Pulser, slot: int = 0) -> PairScore | None:
+        """Score one pair from scratch, or ``None`` if the pulser cannot take the order."""
         if not pulser.online or pulser.active_tasks + slot >= pulser.max_tasks:
             return None
         distance = haversine_km(
@@ -79,13 +132,4 @@ class Scorer:
         )
         if distance > self._s.max_radius_km:
             return None
-        eta = (
-            self.eta_minutes(distance, pulser.vehicle) + slot * self._s.stacked_order_delay_minutes
-        )
-        cost = (
-            self._w_distance * (distance / self._s.max_radius_km)
-            + self._w_eta * min(eta / self._s.max_eta_minutes, 1.0)
-            + self._w_rating * (1.0 - pulser.rating / 5.0)
-            + self._w_load * ((pulser.active_tasks + slot) / pulser.max_tasks)
-        )
-        return PairScore(cost=cost, distance_km=distance, eta_minutes=eta)
+        return self.slot_score(self.terms(pulser, distance), pulser, slot)

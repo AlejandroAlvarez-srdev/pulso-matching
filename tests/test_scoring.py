@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from pulso_matching.config import Settings
@@ -82,3 +83,32 @@ def test_weights_are_normalised() -> None:
 def test_all_zero_weights_rejected() -> None:
     with pytest.raises(ValueError, match="weight"):
         Settings(weight_distance=0, weight_eta=0, weight_rating=0, weight_load=0)
+
+
+@pytest.mark.parametrize("slot", [0, 1, 2])
+def test_vectorised_slot_costs_match_scalar(scorer: Scorer, slot: int) -> None:
+    pulsers = [
+        make_pulser("a", rating=4.9, active_tasks=0, max_tasks=4, vehicle=Vehicle.BIKE),
+        make_pulser("b", rating=3.1, active_tasks=1, max_tasks=5, vehicle=Vehicle.CAR),
+    ]
+    distances = [0.4, 6.5]
+    terms = [scorer.terms(p, d) for p, d in zip(pulsers, distances, strict=True)]
+    vec = scorer.slot_costs(
+        np.array([t.static_cost for t in terms]),
+        np.array([t.base_eta_minutes for t in terms]),
+        np.array([float(p.active_tasks) for p in pulsers]),
+        np.array([float(p.max_tasks) for p in pulsers]),
+        slot,
+    )
+    for k, (t, p) in enumerate(zip(terms, pulsers, strict=True)):
+        scalar = scorer.slot_score(t, p, slot)
+        assert scalar is not None
+        assert vec[k] == pytest.approx(scalar.cost)
+
+
+def test_cached_terms_reproduce_from_scratch_score(scorer: Scorer) -> None:
+    order, pulser = make_order(), make_pulser("p", lat=CDMX[0] + 2 * ONE_KM_LAT, active_tasks=1)
+    fresh = scorer.score(order, pulser, slot=1)
+    assert fresh is not None
+    cached = scorer.slot_score(scorer.terms(pulser, fresh.distance_km), pulser, 1)
+    assert cached == fresh

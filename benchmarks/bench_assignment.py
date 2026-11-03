@@ -133,7 +133,8 @@ def run(n: int, ratio: float, side_km: float, rng: random.Random) -> Row:
     assert set(edges) == set(all_pairs), "grid pre-filter must not change the candidate set"
 
     matrix: CostMatrix = [
-        [e.cost if (e := edges.get((i, j))) else None for j in range(m)] for i in range(n)
+        [all_pairs[(i, j)].cost if (i, j) in all_pairs else None for j in range(m)]
+        for i in range(n)
     ]
     h_pairs, h_ms = timed(lambda: hungarian_assignment(matrix))
     np_pairs, np_ms = timed(lambda: hungarian_assignment_np(matrix))

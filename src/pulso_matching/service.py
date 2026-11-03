@@ -30,11 +30,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
+import numpy as np
 import structlog
 
-from pulso_matching.assignment import greedy_assignment, hungarian_assignment_np
+from pulso_matching.assignment import FloatMatrix, greedy_assignment, hungarian_assignment_np
 from pulso_matching.models import Assignment, Candidate, Order, Pulser, Strategy
-from pulso_matching.scoring import PairScore, Scorer
+from pulso_matching.scoring import PairTerms, Scorer
 from pulso_matching.spatial import GridIndex
 
 log = structlog.get_logger(__name__)
@@ -86,20 +87,68 @@ class MatchingService:
 
     def candidate_edges(
         self, orders: list[Order], pulsers: list[Pulser]
-    ) -> dict[tuple[int, int], PairScore]:
-        """Feasible (order index, pulser index) pairs, found through the grid index."""
+    ) -> dict[tuple[int, int], PairTerms]:
+        """Feasible (order index, pulser index) pairs with their cached slot-independent terms.
+
+        The grid query already returns the haversine distance, so each pair's distance is
+        computed exactly once per batch.
+        """
         radius = self._scorer.max_radius_km
         index: GridIndex[int] = GridIndex(cell_km=radius)
         for j, p in enumerate(pulsers):
             if self._scorer.is_eligible(p):
                 index.insert(j, p.location.lat, p.location.lng)
-        edges: dict[tuple[int, int], PairScore] = {}
+        edges: dict[tuple[int, int], PairTerms] = {}
         for i, order in enumerate(orders):
-            for j, _ in index.query(order.pickup.lat, order.pickup.lng, radius):
-                score = self._scorer.score(order, pulsers[j])
-                if score is not None:
-                    edges[(i, j)] = score
+            for j, distance in index.query(order.pickup.lat, order.pickup.lng, radius):
+                edges[(i, j)] = self._scorer.terms(pulsers[j], distance)
         return edges
+
+    def _component_matrix(
+        self,
+        rows: list[int],
+        pulser_cols: list[int],
+        adjacency: dict[int, list[int]],
+        edges: dict[tuple[int, int], PairTerms],
+        pulsers: list[Pulser],
+    ) -> tuple[FloatMatrix, list[tuple[int, int]]]:
+        """Dense slot-expanded cost matrix for one component, built from the cached terms.
+
+        One vectorised pass per slot level fills every pair's column for that slot: O(E_c · S)
+        for E_c component edges and S max slots, instead of re-scoring each (pair, slot).
+        """
+        slots = [self._scorer.batch_slots(pulsers[j]) for j in pulser_cols]
+        col_start = np.concatenate(([0], np.cumsum(slots)[:-1])).astype(np.intp)
+        cols = [
+            (j, k) for j, n_slots in zip(pulser_cols, slots, strict=True) for k in range(n_slots)
+        ]
+        pcol_of = {j: c for c, j in enumerate(pulser_cols)}
+
+        r_idx: list[int] = []
+        c_idx: list[int] = []
+        for r, i in enumerate(rows):
+            for j in adjacency.get(i, ()):
+                r_idx.append(r)
+                c_idx.append(pcol_of[j])
+        r_arr = np.asarray(r_idx, dtype=np.intp)
+        c_arr = np.asarray(c_idx, dtype=np.intp)
+        pair_terms = [edges[(rows[r], pulser_cols[c])] for r, c in zip(r_idx, c_idx, strict=True)]
+        static = np.fromiter((t.static_cost for t in pair_terms), np.float64, len(pair_terms))
+        base_eta = np.fromiter(
+            (t.base_eta_minutes for t in pair_terms), np.float64, len(pair_terms)
+        )
+        active = np.asarray([pulsers[j].active_tasks for j in pulser_cols], np.float64)[c_arr]
+        max_tasks = np.asarray([pulsers[j].max_tasks for j in pulser_cols], np.float64)[c_arr]
+        n_slots = np.asarray(slots, dtype=np.intp)[c_arr]
+
+        matrix = np.full((len(rows), len(cols)), np.inf)
+        for k in range(max(slots, default=0)):
+            mask = n_slots > k
+            costs = self._scorer.slot_costs(
+                static[mask], base_eta[mask], active[mask], max_tasks[mask], k
+            )
+            matrix[r_arr[mask], col_start[c_arr[mask]] + k] = costs + k * SLOT_TIE_BREAK
+        return matrix, cols
 
     def assign_batch(
         self, orders: list[Order], pulsers: list[Pulser], strategy: Strategy
@@ -107,6 +156,9 @@ class MatchingService:
         started = time.perf_counter()
         n = len(orders)
         edges = self.candidate_edges(orders, pulsers)
+        adjacency: dict[int, list[int]] = defaultdict(list)
+        for i, j in edges:
+            adjacency[i].append(j)
 
         # Union-find over n order nodes followed by m pulser nodes.
         uf = _UnionFind(n + len(pulsers))
@@ -124,24 +176,11 @@ class MatchingService:
         for rows, pulser_cols in components.values():
             if not pulser_cols:
                 continue
-            cols = [
-                (j, k) for j in pulser_cols for k in range(self._scorer.batch_slots(pulsers[j]))
-            ]
-            slot_scores: dict[tuple[int, int, int], PairScore] = {}
-            matrix: list[list[float | None]] = []
-            for i in rows:
-                row: list[float | None] = []
-                for j, k in cols:
-                    pair = self._scorer.score(orders[i], pulsers[j], k) if (i, j) in edges else None
-                    if pair is None:
-                        row.append(None)
-                    else:
-                        slot_scores[(i, j, k)] = pair
-                        row.append(pair.cost + k * SLOT_TIE_BREAK)
-                matrix.append(row)
+            matrix, cols = self._component_matrix(rows, pulser_cols, adjacency, edges, pulsers)
             for r, c in solve(matrix):
                 i, (j, k) = rows[r], cols[c]
-                pair = slot_scores[(i, j, k)]
+                pair = self._scorer.slot_score(edges[(i, j)], pulsers[j], k)
+                assert pair is not None  # the matrix entry was finite
                 assignments.append(
                     Assignment(
                         order_id=orders[i].id,
