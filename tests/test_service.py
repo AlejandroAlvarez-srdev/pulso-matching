@@ -1,15 +1,18 @@
 import itertools
 import random
+import time
 from collections import Counter
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from pulso_matching.assignment import BudgetExceededError, FloatMatrix, Pairs
 from pulso_matching.config import Settings
 from pulso_matching.models import Order, Pulser, Strategy
 from pulso_matching.scoring import Scorer
 from pulso_matching.service import MatchingService
+from pulso_matching.timeouts import DeadlineExceededError
 from tests.factories import CDMX, make_order, make_pulser
 
 KM = 1 / 111.195  # degrees of latitude per km
@@ -227,11 +230,33 @@ def test_exhausted_budget_degrades_to_greedy_on_the_same_matrix() -> None:
     assert pairs == {(a.order_id, a.pulser_id) for a in greedy.assignments}
 
 
-def test_request_deadline_also_caps_hungarian() -> None:
+def test_passed_request_deadline_stops_the_batch() -> None:
     orders, pulsers = _random_city(4, 10, 10)
     service = MatchingService(Scorer(Settings()))
-    result = service.assign_batch(orders, pulsers, Strategy.HUNGARIAN, deadline=0.0)
-    assert result.degraded
+    for strategy in Strategy:
+        with pytest.raises(DeadlineExceededError):
+            service.assign_batch(orders, pulsers, strategy, deadline=0.0)
+
+
+def test_request_deadline_during_hungarian_stops_instead_of_degrading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orders, pulsers = _random_city(4, 10, 10)
+    service = MatchingService(Scorer(Settings()))
+
+    def slow_hungarian(matrix: FloatMatrix, deadline: float | None = None) -> Pairs:
+        time.sleep(0.2)  # the request deadline passes while "solving"
+        raise BudgetExceededError
+
+    def greedy_must_not_run(matrix: FloatMatrix) -> Pairs:
+        raise AssertionError("greedy fallback ran after the request deadline")
+
+    monkeypatch.setattr("pulso_matching.service.hungarian_assignment_np", slow_hungarian)
+    monkeypatch.setattr("pulso_matching.service.greedy_assignment", greedy_must_not_run)
+    with pytest.raises(DeadlineExceededError):
+        service.assign_batch(
+            orders, pulsers, Strategy.HUNGARIAN, deadline=time.perf_counter() + 0.1
+        )
 
 
 def test_generous_budget_keeps_the_optimum() -> None:

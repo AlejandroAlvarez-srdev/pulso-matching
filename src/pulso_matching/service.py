@@ -51,6 +51,7 @@ from pulso_matching.assignment import (
 from pulso_matching.models import Assignment, Candidate, Order, Pulser, Strategy
 from pulso_matching.scoring import PairTerms, Scorer
 from pulso_matching.spatial import GridIndex
+from pulso_matching.timeouts import check_deadline
 
 log = structlog.get_logger(__name__)
 
@@ -104,7 +105,7 @@ class MatchingService:
         ]
 
     def candidate_edges(
-        self, orders: list[Order], pulsers: list[Pulser]
+        self, orders: list[Order], pulsers: list[Pulser], deadline: float | None = None
     ) -> dict[tuple[int, int], PairTerms]:
         """Feasible (order index, pulser index) pairs with their cached slot-independent terms.
 
@@ -118,6 +119,7 @@ class MatchingService:
                 index.insert(j, p.location.lat, p.location.lng)
         edges: dict[tuple[int, int], PairTerms] = {}
         for i, order in enumerate(orders):
+            check_deadline(deadline)
             for j, distance in index.query(order.pickup.lat, order.pickup.lng, radius):
                 edges[(i, j)] = self._scorer.terms(pulsers[j], distance)
         return edges
@@ -178,7 +180,9 @@ class MatchingService:
         """Assign ``orders`` to ``pulsers``.
 
         ``deadline`` is a :func:`time.perf_counter` timestamp after which nobody is waiting for
-        the answer; it caps the Hungarian budget (see the module docstring).
+        the answer: it caps the Hungarian budget (see the module docstring), and once it passes
+        the batch stops with :class:`DeadlineExceededError` instead of finishing work that would
+        be thrown away.
         """
         started = time.perf_counter()
         hungarian_deadline = deadline
@@ -186,7 +190,7 @@ class MatchingService:
             budget_end = started + self._hungarian_budget_ms / 1000
             hungarian_deadline = min(budget_end, deadline or budget_end)
         n = len(orders)
-        edges = self.candidate_edges(orders, pulsers)
+        edges = self.candidate_edges(orders, pulsers, deadline)
         adjacency: dict[int, list[int]] = defaultdict(list)
         for i, j in edges:
             adjacency[i].append(j)
@@ -210,12 +214,14 @@ class MatchingService:
         ):
             if not pulser_cols:
                 continue
+            check_deadline(deadline)
             matrix, cols = self._component_matrix(rows, pulser_cols, adjacency, edges, pulsers)
             pairs = None
             if not use_greedy:
                 try:
                     pairs = hungarian_assignment_np(matrix, deadline=hungarian_deadline)
                 except BudgetExceededError:
+                    check_deadline(deadline)  # the request is gone: don't even run greedy
                     use_greedy = True
             if pairs is None:
                 pairs = greedy_assignment(matrix)
