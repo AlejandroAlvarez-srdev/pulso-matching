@@ -2,6 +2,7 @@
 
 Generates synthetic instances in a square of ``--side-km`` centred on Mexico City
 (``m = ratio · n`` pulsers with random rating, load and vehicle) and prints a Markdown table.
+Solver columns use one order per pulser; ``cap-aware`` runs the default capacity-aware service.
 
     python -m benchmarks.bench_assignment --sizes 50 100 200 400 --side-km 33 --seed 42
 """
@@ -44,6 +45,8 @@ class Row:
     hungarian_np_ms: float
     greedy_ms: float
     service_ms: float
+    capacity_ms: float
+    capacity_matched: int
     components: int
     hungarian_matched: int
     greedy_matched: int
@@ -115,7 +118,7 @@ def _count_components(edges: Iterable[tuple[int, int]], n: int) -> int:
 def run(n: int, ratio: float, side_km: float, rng: random.Random) -> Row:
     m = max(1, round(n * ratio))
     orders, pulsers = make_instance(n, m, side_km, rng)
-    scorer = Scorer(Settings())
+    scorer = Scorer(Settings(max_orders_per_pulser_per_batch=1))
     service = MatchingService(scorer)
 
     edges, grid_ms = timed(lambda: service.candidate_edges(orders, pulsers))
@@ -137,9 +140,14 @@ def run(n: int, ratio: float, side_km: float, rng: random.Random) -> Row:
     assert len(np_pairs) == len(h_pairs)
     assert math.isclose(solve_cost(matrix, np_pairs), solve_cost(matrix, h_pairs), abs_tol=1e-6)
     g_pairs, g_ms = timed(lambda: greedy_assignment(matrix))
-    # End to end: grid + connected components + Hungarian per component.
+    # End to end: grid + connected components + Hungarian per component, one order per pulser
+    # (same problem as the matrix above, so the optimum must match).
     batch, service_ms = timed(lambda: service.assign_batch(orders, pulsers, Strategy.HUNGARIAN))
     assert len(batch.assignments) == len(h_pairs), "component split must keep the optimum"
+    # Capacity-aware: pulsers with free slots may take several orders.
+    cap_service = MatchingService(Scorer(Settings()))
+    cap, cap_ms = timed(lambda: cap_service.assign_batch(orders, pulsers, Strategy.HUNGARIAN))
+    assert len(cap.assignments) >= len(h_pairs)
     return Row(
         n=n,
         m=m,
@@ -150,6 +158,8 @@ def run(n: int, ratio: float, side_km: float, rng: random.Random) -> Row:
         hungarian_np_ms=np_ms,
         greedy_ms=g_ms,
         service_ms=service_ms,
+        capacity_ms=cap_ms,
+        capacity_matched=len(cap.assignments),
         components=_count_components(edges, n),
         hungarian_matched=len(h_pairs),
         greedy_matched=len(g_pairs),
@@ -171,9 +181,9 @@ def main() -> None:
     print(
         "| orders | pulsers | feasible pairs | components | grid ms | all-pairs ms "
         "| hungarian py ms | hungarian np ms | greedy ms | service ms "
-        "| matched H / G | avg cost H / G | greedy gap |"
+        "| cap-aware ms | matched H / G / cap | avg cost H / G | greedy gap |"
     )
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|")
     for n in args.sizes:
         r = run(n, args.ratio, args.side_km, rng)
         avg_h = r.hungarian_cost / max(r.hungarian_matched, 1)
@@ -184,7 +194,8 @@ def main() -> None:
             f"| {r.all_pairs_ms:.1f} | {r.hungarian_ms:.1f} | {r.hungarian_np_ms:.1f} "
             f"| {r.greedy_ms:.1f} "
             f"| {r.service_ms:.1f} "
-            f"| {r.hungarian_matched} / {r.greedy_matched} "
+            f"| {r.capacity_ms:.1f} "
+            f"| {r.hungarian_matched} / {r.greedy_matched} / {r.capacity_matched} "
             f"| {avg_h:.4f} / {avg_g:.4f} | {gap:+.1f} % |"
         )
 

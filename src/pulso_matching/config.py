@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     road_factor: float = Field(default=1.3, ge=1)
     pickup_overhead_minutes: float = Field(default=3.0, ge=0)
 
+    # Capacity-aware batching: a pulser with spare capacity may take up to this many orders per
+    # batch; each stacked order waits for the previous ones.
+    max_orders_per_pulser_per_batch: int = Field(default=3, ge=1)
+    stacked_order_delay_minutes: float = Field(default=12.0, ge=0)
+
     log_level: str = "INFO"
     log_json: bool = True
 

@@ -58,20 +58,34 @@ class Scorer:
     def is_eligible(self, pulser: Pulser) -> bool:
         return pulser.online and pulser.has_capacity
 
-    def score(self, order: Order, pulser: Pulser) -> PairScore | None:
-        """Return the pair score, or ``None`` if the pulser cannot take the order."""
+    def batch_slots(self, pulser: Pulser) -> int:
+        """How many orders this pulser may receive in one batch (0 if ineligible)."""
         if not self.is_eligible(pulser):
+            return 0
+        free = pulser.max_tasks - pulser.active_tasks
+        return min(free, self._s.max_orders_per_pulser_per_batch)
+
+    def score(self, order: Order, pulser: Pulser, slot: int = 0) -> PairScore | None:
+        """Return the pair score, or ``None`` if the pulser cannot take the order.
+
+        ``slot`` is the number of orders already stacked on this pulser in the current batch:
+        it raises the load term to ``(activeTasks + slot) / maxTasks`` and delays the ETA by
+        ``slot · stacked_order_delay_minutes`` (they finish the earlier ones first).
+        """
+        if not pulser.online or pulser.active_tasks + slot >= pulser.max_tasks:
             return None
         distance = haversine_km(
             pulser.location.lat, pulser.location.lng, order.pickup.lat, order.pickup.lng
         )
         if distance > self._s.max_radius_km:
             return None
-        eta = self.eta_minutes(distance, pulser.vehicle)
+        eta = (
+            self.eta_minutes(distance, pulser.vehicle) + slot * self._s.stacked_order_delay_minutes
+        )
         cost = (
             self._w_distance * (distance / self._s.max_radius_km)
             + self._w_eta * min(eta / self._s.max_eta_minutes, 1.0)
             + self._w_rating * (1.0 - pulser.rating / 5.0)
-            + self._w_load * (pulser.active_tasks / pulser.max_tasks)
+            + self._w_load * ((pulser.active_tasks + slot) / pulser.max_tasks)
         )
         return PairScore(cost=cost, distance_km=distance, eta_minutes=eta)

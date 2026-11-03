@@ -1,9 +1,13 @@
+import itertools
 import random
+from collections import Counter
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from pulso_matching.config import Settings
-from pulso_matching.models import Strategy
+from pulso_matching.models import Order, Pulser, Strategy
 from pulso_matching.scoring import Scorer
 from pulso_matching.service import MatchingService
 from tests.factories import CDMX, make_order, make_pulser
@@ -29,8 +33,8 @@ def test_hungarian_saves_order_that_greedy_strands(service: MatchingService) -> 
     # B only reaches P1; A is closest to P1 but can also use P2.
     b = make_order(lat=CDMX[0])
     a = make_order(lat=CDMX[0] + 3.1 * KM)
-    p1 = make_pulser("p1", lat=CDMX[0] + 3 * KM)
-    p2 = make_pulser("p2", lat=CDMX[0] + 9 * KM)
+    p1 = make_pulser("p1", lat=CDMX[0] + 3 * KM, max_tasks=1)
+    p2 = make_pulser("p2", lat=CDMX[0] + 9 * KM, max_tasks=1)
     greedy = service.assign_batch([a, b], [p1, p2], Strategy.GREEDY)
     optimal = service.assign_batch([a, b], [p1, p2], Strategy.HUNGARIAN)
     assert greedy.unassigned_order_ids == [b.id]
@@ -68,9 +72,13 @@ def test_batch_invariants_on_random_city(service: MatchingService, strategy: Str
     ]
     result = service.assign_batch(orders, pulsers, strategy)
     by_id = {p.id: p for p in pulsers}
-    used = [a.pulser_id for a in result.assignments]
-    assert len(used) == len(set(used))
-    assert all(by_id[pid].has_capacity for pid in used)
+    taken = Counter(a.pulser_id for a in result.assignments)
+    for pid, count in taken.items():
+        p = by_id[pid]
+        assert count <= min(
+            p.max_tasks - p.active_tasks, Settings().max_orders_per_pulser_per_batch
+        )
+    assert len({a.order_id for a in result.assignments}) == len(result.assignments)
     assert len(result.assignments) + len(result.unassigned_order_ids) == len(orders)
 
 
@@ -92,3 +100,105 @@ def test_grid_prefilter_finds_exactly_the_feasible_pairs(service: MatchingServic
         if scorer.score(o, p) is not None
     }
     assert set(service.candidate_edges(orders, pulsers)) == expected
+
+
+def test_pulser_with_spare_capacity_takes_several_orders(service: MatchingService) -> None:
+    orders = [make_order(lat=CDMX[0] + k * 0.2 * KM) for k in range(4)]
+    busy_hub = make_pulser("hub", active_tasks=1, max_tasks=3)
+    result = service.assign_batch(orders, [busy_hub], Strategy.HUNGARIAN)
+    # Two free slots: two orders, the second one waits for the first.
+    assert [a.pulser_id for a in result.assignments] == ["hub", "hub"]
+    assert len(result.unassigned_order_ids) == 2
+    etas = sorted(a.eta_minutes for a in result.assignments)
+    assert etas[1] - etas[0] >= Settings().stacked_order_delay_minutes - 1
+
+
+def test_batch_cap_limits_orders_per_pulser() -> None:
+    capped = MatchingService(Scorer(Settings(max_orders_per_pulser_per_batch=1)))
+    orders = [make_order(), make_order()]
+    result = capped.assign_batch(orders, [make_pulser("p", max_tasks=5)], Strategy.HUNGARIAN)
+    assert len(result.assignments) == 1
+
+
+def test_stacked_slot_costs_more_than_first(service: MatchingService) -> None:
+    scorer = Scorer(Settings())
+    pulser = make_pulser("p", max_tasks=3)
+    first, second = scorer.score(make_order(), pulser, 0), scorer.score(make_order(), pulser, 1)
+    assert first and second
+    assert second.cost > first.cost
+    assert second.eta_minutes == pytest.approx(first.eta_minutes + 12.0)
+    assert scorer.score(make_order(), pulser, 3) is None
+
+
+def _brute_force_capacity(
+    scorer: Scorer, orders: list[Order], pulsers: list[Pulser]
+) -> tuple[int, float]:
+    """(max matched, min total cost) over every capacity-respecting order→pulser mapping."""
+    best: tuple[int, float] | None = None
+    for choice in itertools.product([None, *range(len(pulsers))], repeat=len(orders)):
+        groups: dict[int, list[int]] = {}
+        for i, j in enumerate(choice):
+            if j is not None:
+                groups.setdefault(j, []).append(i)
+        total = 0.0
+        ok = True
+        for j, members in groups.items():
+            if len(members) > scorer.batch_slots(pulsers[j]):
+                ok = False
+                break
+            # Best way to sequence this pulser's orders into slots 0..k-1.
+            costs = []
+            for perm in itertools.permutations(members):
+                scores = [scorer.score(orders[i], pulsers[j], k) for k, i in enumerate(perm)]
+                if all(sc is not None for sc in scores):
+                    costs.append(sum(sc.cost for sc in scores if sc is not None))
+            if not costs:
+                ok = False
+                break
+            total += min(costs)
+        if not ok:
+            continue
+        matched = len(orders) - choice.count(None)
+        if best is None or (matched, -total) > (best[0], -best[1]):
+            best = (matched, total)
+    assert best is not None
+    return best
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    st.lists(st.tuples(st.floats(-3, 3), st.floats(-3, 3)), min_size=1, max_size=4),
+    st.lists(
+        st.tuples(
+            st.floats(-3, 3),
+            st.floats(-3, 3),
+            st.integers(0, 2),
+            st.integers(1, 3),
+            st.floats(0, 5),
+        ),
+        min_size=1,
+        max_size=3,
+    ),
+)
+def test_capacity_aware_hungarian_matches_brute_force(
+    order_offsets: list[tuple[float, float]],
+    pulser_specs: list[tuple[float, float, int, int, float]],
+) -> None:
+    scorer = Scorer(Settings())
+    service = MatchingService(scorer)
+    orders = [make_order(CDMX[0] + dy * KM, CDMX[1] + dx * KM) for dy, dx in order_offsets]
+    pulsers = [
+        make_pulser(
+            f"p{k}",
+            CDMX[0] + dy * KM,
+            CDMX[1] + dx * KM,
+            active_tasks=min(active, max_tasks - 1),
+            max_tasks=max_tasks,
+            rating=rating,
+        )
+        for k, (dy, dx, active, max_tasks, rating) in enumerate(pulser_specs)
+    ]
+    result = service.assign_batch(orders, pulsers, Strategy.HUNGARIAN)
+    matched, cost = _brute_force_capacity(scorer, orders, pulsers)
+    assert len(result.assignments) == matched
+    assert len(result.assignments) - result.total_score == pytest.approx(cost, abs=1e-4)

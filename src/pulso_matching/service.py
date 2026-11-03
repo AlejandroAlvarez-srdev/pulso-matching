@@ -10,8 +10,15 @@ Batch pipeline and cost
    isolated neighbourhoods is many small problems, not one big one.
 4. Solve each component with the selected strategy and map indices back to ids.
 
-Each pulser takes at most one order per batch: a batch is one dispatch tick, and their load
-(and therefore score) changes once they accept.
+Capacity-aware columns
+----------------------
+A pulser with ``s = min(maxTasks - activeTasks, max_orders_per_pulser_per_batch)`` free slots is
+expanded into ``s`` columns. Column ``k`` is "this pulser's (k+1)-th order in the batch": its load
+term uses ``activeTasks + k`` and its ETA waits ``k · stacked_order_delay_minutes``. Costs are
+non-decreasing in ``k`` for every order (plus a ``k · 1e-9`` tie-breaker), so an optimal solution
+always fills a pulser's slots in order, and a standard one-to-one assignment solves the
+many-to-one problem. The price is a wider matrix: ``m`` becomes ``Σ slots``, which Hungarian pays
+linearly (O(n² · Σ slots)).
 """
 
 from __future__ import annotations
@@ -25,12 +32,14 @@ from uuid import UUID
 
 import structlog
 
-from pulso_matching.assignment import CostMatrix, greedy_assignment, hungarian_assignment_np
+from pulso_matching.assignment import greedy_assignment, hungarian_assignment_np
 from pulso_matching.models import Assignment, Candidate, Order, Pulser, Strategy
 from pulso_matching.scoring import PairScore, Scorer
 from pulso_matching.spatial import GridIndex
 
 log = structlog.get_logger(__name__)
+
+SLOT_TIE_BREAK = 1e-9
 
 SOLVERS = {Strategy.HUNGARIAN: hungarian_assignment_np, Strategy.GREEDY: greedy_assignment}
 
@@ -112,15 +121,27 @@ class MatchingService:
         solve = SOLVERS[strategy]
         now = datetime.now(UTC)
         assignments: list[Assignment] = []
-        for rows, cols in components.values():
-            if not cols:
+        for rows, pulser_cols in components.values():
+            if not pulser_cols:
                 continue
-            matrix: CostMatrix = [
-                [e.cost if (e := edges.get((i, j))) else None for j in cols] for i in rows
+            cols = [
+                (j, k) for j in pulser_cols for k in range(self._scorer.batch_slots(pulsers[j]))
             ]
+            slot_scores: dict[tuple[int, int, int], PairScore] = {}
+            matrix: list[list[float | None]] = []
+            for i in rows:
+                row: list[float | None] = []
+                for j, k in cols:
+                    pair = self._scorer.score(orders[i], pulsers[j], k) if (i, j) in edges else None
+                    if pair is None:
+                        row.append(None)
+                    else:
+                        slot_scores[(i, j, k)] = pair
+                        row.append(pair.cost + k * SLOT_TIE_BREAK)
+                matrix.append(row)
             for r, c in solve(matrix):
-                i, j = rows[r], cols[c]
-                pair = edges[(i, j)]
+                i, (j, k) = rows[r], cols[c]
+                pair = slot_scores[(i, j, k)]
                 assignments.append(
                     Assignment(
                         order_id=orders[i].id,
