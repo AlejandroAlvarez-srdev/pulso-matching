@@ -8,10 +8,11 @@ from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 import structlog
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Body, Depends, FastAPI, Request, Response
 
 from pulso_matching import __version__
 from pulso_matching.config import Settings, get_settings
+from pulso_matching.examples import BATCH_EXAMPLES, MATCH_EXAMPLES
 from pulso_matching.logging_config import configure_logging
 from pulso_matching.models import (
     BatchMatchRequest,
@@ -19,6 +20,7 @@ from pulso_matching.models import (
     MatchRequest,
     MatchResponse,
 )
+from pulso_matching.problems import install_problem_handlers, problem_responses
 from pulso_matching.scoring import Scorer
 from pulso_matching.service import MatchingService
 
@@ -40,6 +42,8 @@ def create_app() -> FastAPI:
         version=__version__,
         description="Assigns Pulso orders to pulsers (fictional company).",
     )
+
+    install_problem_handlers(app)
 
     @app.middleware("http")
     async def access_log(
@@ -67,14 +71,30 @@ def create_app() -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
-    @app.post("/match", response_model=MatchResponse, response_model_by_alias=True)
-    def match(body: MatchRequest, service: ServiceDep) -> MatchResponse:
+    @app.post(
+        "/match",
+        response_model=MatchResponse,
+        response_model_by_alias=True,
+        responses=problem_responses(422),
+    )
+    def match(
+        body: Annotated[MatchRequest, Body(openapi_examples=MATCH_EXAMPLES)],
+        service: ServiceDep,
+    ) -> MatchResponse:
         """Rank pulsers for one order (best first)."""
         candidates = service.rank(body.order, body.pulsers, body.limit)
         return MatchResponse(order_id=body.order.id, candidates=candidates)
 
-    @app.post("/match/batch", response_model=BatchMatchResponse, response_model_by_alias=True)
-    def match_batch(body: BatchMatchRequest, service: ServiceDep) -> BatchMatchResponse:
+    @app.post(
+        "/match/batch",
+        response_model=BatchMatchResponse,
+        response_model_by_alias=True,
+        responses=problem_responses(422),
+    )
+    def match_batch(
+        body: Annotated[BatchMatchRequest, Body(openapi_examples=BATCH_EXAMPLES)],
+        service: ServiceDep,
+    ) -> BatchMatchResponse:
         """Assign N orders to M pulsers (one order per pulser) minimising total cost."""
         result = service.assign_batch(body.orders, body.pulsers, body.strategy)
         return BatchMatchResponse(

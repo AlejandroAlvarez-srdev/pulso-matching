@@ -3,10 +3,14 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from fastapi.openapi.models import Example
 from fastapi.testclient import TestClient
 
 from pulso_matching.config import Settings, get_settings
-from pulso_matching.main import app
+from pulso_matching.examples import BATCH_EXAMPLES, MATCH_EXAMPLES
+from pulso_matching.main import app, get_service
+from pulso_matching.problems import PROBLEM_JSON
+from pulso_matching.service import MatchingService
 
 KM = 1 / 111.195
 CDMX = (19.4326, -99.1332)
@@ -150,3 +154,64 @@ def test_weights_come_from_settings(client: TestClient) -> None:
         },
     )
     assert [c["pulserId"] for c in res.json()["candidates"]] == ["star", "near"]
+
+
+def test_validation_errors_are_problem_json(client: TestClient) -> None:
+    res = client.post("/match", json={"order": order(), "pulsers": [pulser("p", rating=6)]})
+    assert res.status_code == 422
+    assert res.headers["content-type"] == PROBLEM_JSON
+    body = res.json()
+    assert body["type"].endswith("/validation")
+    assert body["status"] == 422
+    assert body["instance"] == "/match"
+    assert body["errors"][0]["loc"] == ["body", "pulsers", 0, "rating"]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "status"), [("GET", "/nope", 404), ("GET", "/match", 405)]
+)
+def test_http_errors_are_problem_json(
+    client: TestClient, method: str, path: str, status: int
+) -> None:
+    res = client.request(method, path)
+    assert res.status_code == status
+    assert res.headers["content-type"] == PROBLEM_JSON
+    assert res.json()["status"] == status
+    assert res.json()["type"] == "about:blank"
+
+
+def test_unhandled_errors_are_problem_json() -> None:
+    def broken() -> MatchingService:
+        raise RuntimeError("boom")
+
+    app.dependency_overrides[get_service] = broken
+    try:
+        with TestClient(app, raise_server_exceptions=False) as c:
+            res = c.post("/match", json={"order": order(), "pulsers": []})
+    finally:
+        app.dependency_overrides.clear()
+    assert res.status_code == 500
+    assert res.headers["content-type"] == PROBLEM_JSON
+    assert "boom" not in res.text
+
+
+def test_openapi_documents_examples_and_problem_model(client: TestClient) -> None:
+    spec = client.get("/openapi.json").json()
+    batch = spec["paths"]["/match/batch"]["post"]
+    assert set(batch["requestBody"]["content"]["application/json"]["examples"]) == {
+        "hungarian",
+        "greedy",
+    }
+    assert PROBLEM_JSON in batch["responses"]["422"]["content"]
+    assert "Problem" in spec["components"]["schemas"]
+
+
+@pytest.mark.parametrize(
+    ("path", "examples"), [("/match", MATCH_EXAMPLES), ("/match/batch", BATCH_EXAMPLES)]
+)
+def test_openapi_examples_are_valid_requests(
+    client: TestClient, path: str, examples: dict[str, Example]
+) -> None:
+    for example in examples.values():
+        res = client.post(path, json=example.get("value"))
+        assert res.status_code == 200, res.text
