@@ -1,4 +1,9 @@
-# pulso-matching
+<p align="center"><img src="assets/banner.svg" alt="pulso-matching" width="100%"></p>
+
+<p align="center"><img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI"> <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"> <img src="https://img.shields.io/badge/NumPy-013243?style=for-the-badge&logo=numpy&logoColor=white" alt="NumPy"> <img src="https://img.shields.io/badge/Prometheus-E6522C?style=for-the-badge&logo=prometheus&logoColor=white" alt="Prometheus"> <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker"> <img src="https://img.shields.io/badge/GitHub_Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white" alt="GitHub Actions"> <img src="https://img.shields.io/badge/20_commits-6a178c?style=for-the-badge" alt="20 commits"></p>
+
+<h1 align="center">pulso-matching</h1>
+<!-- /header -->
 
 A FastAPI service that decides **which pulser should take which order**. It ranks candidates for a
 single order and solves batch dispatch (N orders × M pulsers) as a min-cost bipartite assignment:
@@ -15,6 +20,17 @@ It exposes Prometheus metrics, returns RFC 9457 errors, and enforces a per-reque
 
 > Pulso is a fictional company used to explore these patterns: an on-demand micro-task
 > marketplace in LatAm where merchants post orders and independent "pulsers" pick them up.
+
+## At a glance
+
+<table>
+  <tr>
+    <td align="center" width="25%"><b>90 incl. property-based</b><br>Tests</td>
+    <td align="center" width="25%"><b>Hungarian vs brute force</b><br>Optimal</td>
+    <td align="center" width="25%"><b>NumPy 3.5–8× faster</b><br>Speed</td>
+    <td align="center" width="25%"><b>Budget → greedy fallback, 504 deadline</b><br>Resilience</td>
+  </tr>
+</table>
 
 ## Architecture
 
