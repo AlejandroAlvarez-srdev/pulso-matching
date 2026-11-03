@@ -1,9 +1,17 @@
 # pulso-matching
 
 A FastAPI service that decides **which pulser should take which order**. It ranks candidates for a
-single order and solves batch dispatch (N orders × M pulsers) as a min-cost bipartite assignment
-with a from-scratch **Hungarian algorithm**, a greedy baseline, and a spatial grid index so large
-inputs don't pay for every order–pulser pair.
+single order and solves batch dispatch (N orders × M pulsers) as a min-cost bipartite assignment:
+
+- **Hungarian algorithm**, written from scratch, with a NumPy-vectorised variant that the service
+  runs and a pure-Python reference.
+- **Capacity-aware**: a pulser with spare capacity can take several orders in one batch.
+- **Time budget**: when Hungarian runs past its budget, the batch falls back to greedy instead of
+  timing out.
+- **Spatial grid index** with cached pair scores, so large inputs don't pay for every
+  order–pulser pair.
+
+It exposes Prometheus metrics, returns RFC 9457 errors, and enforces a per-request timeout.
 
 > Pulso is a fictional company used to explore these patterns: an on-demand micro-task
 > marketplace in LatAm where merchants post orders and independent "pulsers" pick them up.
@@ -14,42 +22,55 @@ inputs don't pay for every order–pulser pair.
 flowchart LR
     C["Client / dispatcher"] -->|POST /match| API
     C -->|POST /match/batch| API
+    P["Prometheus"] -->|GET /metrics| API
     subgraph Service
-        API["FastAPI routes<br/>pydantic v2 validation"] --> S["MatchingService"]
+        API["FastAPI routes<br/>pydantic v2 · problem+json<br/>request timeout"] --> S["MatchingService<br/>(worker thread + deadline)"]
         S --> G["GridIndex<br/>radius pre-filter"]
-        S --> SC["Scorer<br/>haversine · ETA · rating · load"]
-        S --> UF["Union-find<br/>connected components"]
-        UF --> H["Hungarian O(n²m)"]
-        UF --> GR["Greedy heap O(nm log nm)"]
+        G --> T["PairTerms cache<br/>distance · ETA · rating"]
+        T --> UF["Union-find<br/>connected components"]
+        UF --> M["Slot-expanded cost matrix<br/>(capacity-aware, NumPy)"]
+        M --> H["Hungarian (NumPy)<br/>under time budget"]
+        H -. "budget exceeded" .-> GR["Greedy heap<br/>same matrix"]
     end
-    CFG["Settings<br/>PULSO_* env"] --> SC
+    CFG["Settings<br/>PULSO_* env"] --> S
     S --> L[("structlog JSON<br/>pulser.assigned / assignment.failed")]
 ```
 
 Batch pipeline (`src/pulso_matching/service.py`):
 
-1. Drop pulsers that are offline or at `maxTasks`; insert the rest into a lat/lng grid — **O(m)**.
-2. For every order, query the grid for pulsers within `maxRadiusKm` and score only those —
-   **O(n·k)** with `k` neighbours, instead of **O(n·m)**.
-3. Split the bipartite candidate graph into connected components (union-find). Orders in different
-   components never compete, so each is solved on its own: Σ O(nᵢ²·mᵢ) instead of O(n²·m).
-4. Solve each component with the chosen strategy; orders left without a feasible pulser are
-   returned in `unassignedOrderIds` and logged as `assignment.failed`.
+1. Insert eligible pulsers (online, below `maxTasks`) into a lat/lng grid: **O(m)**.
+2. For each order, query the grid for pulsers within `maxRadiusKm`: **O(n·k)** for `k`
+   neighbours, instead of **O(n·m)**. The haversine distance the grid already computed becomes a
+   cached `PairTerms` (distance, base ETA, distance + rating cost). It is never recomputed.
+3. Split the bipartite candidate graph into connected components (union-find). Each component is
+   solved independently: Σ O(nᵢ²·mᵢ) instead of O(n²·m).
+4. Per component, expand each pulser into its free **slots** and fill the cost matrix from the
+   cache with one NumPy pass per slot level.
+5. Solve components smallest first with Hungarian under a wall-clock budget. If the budget runs
+   out, the remaining components are solved with greedy on the same matrices, and the response
+   is flagged `degraded`.
+6. If the *request* deadline passes, the work stops altogether and the client gets a 504.
 
 ```
 src/pulso_matching/
-├── main.py              FastAPI app, request-id + access-log middleware
-├── service.py           rank() and assign_batch() use-cases
-├── scoring.py           weighted cost in [0, 1]
+├── main.py              FastAPI app, request-id/access-log/metrics middleware
+├── service.py           rank() and assign_batch(): grid → cache → components → slots → solve
+├── scoring.py           PairTerms cache, scalar + vectorised slot costs
 ├── spatial.py           GridIndex[T]
 ├── geo.py               haversine
 ├── assignment/
-│   ├── hungarian.py     Kuhn–Munkres with potentials
+│   ├── hungarian_np.py  NumPy Kuhn–Munkres with deadline (used by the service)
+│   ├── hungarian.py     pure-Python reference
 │   └── greedy.py        heap-based baseline
+├── timeouts.py          per-request timeout + cooperative deadline
+├── problems.py          RFC 9457 problem+json handlers
+├── metrics.py           Prometheus registry
+├── examples.py          OpenAPI request examples
 ├── models.py            pydantic v2 models (camelCase on the wire)
-├── config.py            pydantic-settings (weights, speeds, radius)
+├── config.py            pydantic-settings
 └── logging_config.py    structlog JSON / console
-benchmarks/bench_assignment.py
+benchmarks/bench_assignment.py   solver / pre-filter / service benchmark
+benchmarks/loadtest.py           closed-loop HTTP load test
 ```
 
 ## API
@@ -57,12 +78,14 @@ benchmarks/bench_assignment.py
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness + version |
+| `GET` | `/metrics` | Prometheus exposition |
 | `POST` | `/match` | One order → top-`limit` candidates, best first |
 | `POST` | `/match/batch` | N orders × M pulsers → assignment (`strategy`: `hungarian` \| `greedy`) |
 
 Models follow the shared Pulso contract. Unknown fields are ignored, so a full `Order`
 (`merchantId`, `status`, `items`, `amountCents`, …) can be posted as-is; matching uses `id` and
-`pickup`.
+`pickup`. `/docs` ships realistic Mexico City request examples. The test suite posts every one of
+them, so they can't go stale.
 
 ```bash
 curl -s localhost:8000/match/batch -H 'content-type: application/json' -d '{
@@ -81,30 +104,68 @@ curl -s localhost:8000/match/batch -H 'content-type: application/json' -d '{
                    "score": 0.8158, "etaMinutes": 9.2, "assignedAt": "2026-11-03T20:22:36.096808Z"}],
   "unassignedOrderIds": [],
   "totalScore": 0.8158,
-  "elapsedMs": 0.135
+  "elapsedMs": 0.135,
+  "degraded": false,
+  "degradedComponents": 0
 }
 ```
 
-Interactive docs at `/docs` once running.
+### Errors (RFC 9457)
+
+Every error is `application/problem+json` with the same shape. This covers validation, unknown
+route, wrong method, timeout and unhandled exceptions. A 500 never leaks the exception text; the
+`x-request-id` correlates it with the logs.
+
+```json
+{
+  "type": "https://errors.pulso.example/validation",
+  "title": "Request validation failed",
+  "status": 422,
+  "detail": "1 invalid field",
+  "instance": "/match",
+  "errors": [{"loc": ["body", "pulsers", 0, "rating"],
+              "msg": "Input should be less than or equal to 5", "type": "less_than_equal"}]
+}
+```
+
+| Status | `type` | When |
+|---|---|---|
+| 422 | `…/validation` | body fails pydantic validation (`errors[]` per field) |
+| 404 / 405 | `about:blank` | unknown route / wrong method |
+| 504 | `…/timeout` | request exceeded `PULSO_REQUEST_TIMEOUT_MS` |
+| 500 | `…/internal` | unhandled exception (logged with traceback) |
+
+### Metrics
+
+| Metric | Type | Labels |
+|---|---|---|
+| `pulso_http_request_duration_seconds` | histogram | `method`, `route` (path template, or `unmatched`), `status` |
+| `pulso_assignments_total` | counter | `strategy` |
+| `pulso_unassigned_orders_total` | counter | `strategy` |
+| `pulso_degraded_batches_total` | counter | |
+| `pulso_batch_orders` | histogram | |
+
+The metrics use a dedicated registry, not the process default. Route labels are templates, so
+cardinality stays bounded. With `uvicorn --workers N`, each worker keeps its own counters (no
+multiprocess mode), so scrape the workers individually or run one worker per container.
 
 ## Scoring
 
 For a pair (order *o*, pulser *p*) the pulser must be online, below `maxTasks`, and within
 `PULSO_MAX_RADIUS_KM` of the pickup. Otherwise the pair is infeasible. Feasible pairs get a cost
-in `[0, 1]` (lower is better):
+in `[0, 1]` (lower is better). `slot` is how many orders this pulser already got in the current
+batch (0 for `/match`):
 
 ```
-d    = haversine(p.location, o.pickup)                          # km
-eta  = overhead + d · road_factor / speed(vehicle) · 60         # minutes
-cost = w_d · d / max_radius
+d    = haversine(p.location, o.pickup)                               # km
+eta  = overhead + d · road_factor / speed(vehicle) · 60 + slot · stacked_delay
+cost = w_d · d / max_radius + w_rating · (1 − rating / 5)            # cached per pair (PairTerms)
      + w_eta · min(eta / max_eta, 1)
-     + w_rating · (1 − rating / 5)
-     + w_load · activeTasks / maxTasks
+     + w_load · (activeTasks + slot) / maxTasks                      # per slot
 score = 1 − cost
 ```
 
-The weights are normalised to sum to 1, so only their ratios matter. Every value is a
-`PULSO_*` env var (`config.py`):
+The weights are normalised to sum to 1. Every value is a `PULSO_*` env var (`config.py`):
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -114,6 +175,10 @@ The weights are normalised to sum to 1, so only their ratios matter. Every value
 | `PULSO_SPEED_{BIKE,MOTO,CAR}_KMH` | 14 / 28 / 22 | urban averages (motos beat cars in traffic) |
 | `PULSO_ROAD_FACTOR` | 1.3 | straight line → road distance |
 | `PULSO_PICKUP_OVERHEAD_MINUTES` | 3 | parking, handover |
+| `PULSO_MAX_ORDERS_PER_PULSER_PER_BATCH` | 3 | slot cap (also limited by `maxTasks − activeTasks`) |
+| `PULSO_STACKED_ORDER_DELAY_MINUTES` | 12 | extra ETA per order already stacked on the pulser |
+| `PULSO_HUNGARIAN_BUDGET_MS` | 300 | wall-clock budget before degrading to greedy |
+| `PULSO_REQUEST_TIMEOUT_MS` | 2000 | hard limit per request (504 past it) |
 | `PULSO_LOG_LEVEL`, `PULSO_LOG_JSON` | INFO, true | logging |
 
 ## Algorithms and complexity
@@ -123,21 +188,69 @@ The weights are normalised to sum to 1, so only their ratios matter. Every value
 | Haversine | O(1) | O(1) | spherical Earth, < 0.5 % error vs. ellipsoid |
 | `/match` ranking | O(m log limit) | O(limit) | `heapq.nsmallest` over scored pulsers |
 | Grid build / query | O(m) / O(min(c, o) + k) | O(m) | c = cells touched, o = occupied cells, k = points in them |
-| Hungarian | **O(n²·m)**, n ≤ m (O(n³) square) | O(n·m) | transposes when n > m |
-| Greedy | **O(nm · log nm)** | O(nm) | heapify all feasible pairs, pop until min(n, m) matched |
+| Pair cache + matrices | O(E + E·S) | O(n·Σslots) | E = feasible pairs, S = max slots; one NumPy pass per slot |
+| Hungarian | **O(n²·M)**, n ≤ M (O(n³) square) | O(n·M) | M = Σ slots; transposes when n > M |
+| Greedy | **O(nM · log nM)** | O(nM) | heapify all feasible pairs, pop until min(n, M) matched |
 | Components | ~O(E) | O(n + m) | union-find with path halving |
 
-**Hungarian** (`assignment/hungarian.py`) is the potentials formulation of Kuhn–Munkres: each row
-is added with a Dijkstra-like sweep over columns that keeps reduced costs
-`c[i][j] − u[i] − v[j]` non-negative, then augments along the shortest alternating path.
-Infeasible pairs become a penalty `BIG` larger than any possible difference in total real cost,
-so the optimisation is lexicographic: **first maximise the number of matched orders, then
-minimise cost**. Penalised pairs are dropped from the output.
+### Hungarian, pure and vectorised
 
-**Greedy** (`assignment/greedy.py`) takes the globally cheapest free pair each time. It is fast
-and usually close, but it has no optimality guarantee for min-cost assignment, and it can strand
-an order by giving away its only feasible pulser. `test_hungarian_saves_order_that_greedy_strands`
-shows that case on a map.
+`assignment/hungarian.py` is the potentials formulation of Kuhn–Munkres. Each row is added with a
+Dijkstra-like sweep over columns that keeps reduced costs `c[i][j] − u[i] − v[j]` non-negative,
+then augments along the shortest alternating path. Infeasible pairs become a penalty `BIG` larger
+than any possible difference in total real cost. That makes the optimisation lexicographic:
+**first maximise the number of matched orders, then minimise cost**.
+
+`assignment/hungarian_np.py` is the same algorithm with the column sweep (updating `minv`,
+picking the free column with `argmin`, shifting the potentials) done as O(m) NumPy array
+operations. The Python loop runs once per tree-growth step instead of once per column. The
+complexity is unchanged, but the constants are 3.5–8× better from 400 orders up. It also takes a
+`perf_counter` deadline, checked once per inserted row. Property tests check both variants
+against brute force, and against each other on instances up to 40 × 40.
+
+**Greedy** (`assignment/greedy.py`) takes the globally cheapest free pair each time. It is fast,
+but it has no optimality guarantee for min-cost assignment, and it can strand an order by giving
+away its only feasible pulser. `test_hungarian_saves_order_that_greedy_strands` builds that case
+on a map.
+
+### Capacity-aware assignment
+
+A pulser with `s = min(maxTasks − activeTasks, PULSO_MAX_ORDERS_PER_PULSER_PER_BATCH)` free slots
+becomes `s` columns. Column `k` is "their (k+1)-th order this batch": its load term uses
+`activeTasks + k`, and its ETA waits `k · stacked_delay` because the earlier orders come first.
+For any order, cost never decreases with `k` (a `k · 1e-9` tie-breaker makes it strictly
+increasing). So any optimal solution fills a pulser's slots in order, and the one-to-one solvers
+solve the many-to-one problem exactly. A Hypothesis test checks this against brute force over
+every capacity-respecting mapping *and* every slot sequencing. The cost is a wider matrix: M
+becomes Σ slots, which Hungarian pays for linearly.
+
+### Pair-term cache
+
+The cost splits into a pair part (distance, rating, travel time) and a slot part (load,
+stacking). The pair part is computed once, from the distance the grid query already returned, and
+reused for every slot column, every component matrix, a greedy fallback, and the final reported
+scores. Without the cache, the capacity-aware batch re-scored every (pair, slot) and took ~3.7 s
+at 800 × 1200. With the cache and the vectorised matrix build it takes ~0.9 s.
+
+### Time budget and graceful degradation
+
+Hungarian is O(n²·M). At dispatch time, a slightly worse assignment returned in time beats an
+optimal one the dispatcher has already given up on. So:
+
+- `PULSO_HUNGARIAN_BUDGET_MS` gives Hungarian a wall-clock deadline (capped by the request
+  deadline). Components run smallest first, so the cheap ones still get the optimum. When the
+  deadline passes mid-solve, that component and every remaining one are solved greedily **from
+  the same cached matrix**. The response reports `degraded: true` and `degradedComponents`, the
+  `pulso_degraded_batches_total` counter is incremented, and a `batch.degraded` warning is logged.
+- `PULSO_REQUEST_TIMEOUT_MS` bounds the whole request. The solver runs in a worker thread under
+  `anyio.fail_after`. On expiry the client gets a 504 problem straight away, and the thread is
+  abandoned (Python threads cannot be killed). The same deadline is passed into the service,
+  which checks it per order while scoring, before each component, and per row inside Hungarian,
+  so abandoned work stops instead of competing for the GIL. The load test found this was
+  necessary (see below).
+- The budget is **wall-clock**, so under CPU contention more batches degrade. That is the
+  intended load-shedding behaviour: when the box is busy, the service trades a few percent of
+  assignment quality for latency rather than queueing.
 
 ### Spatial pre-filter trade-offs
 
@@ -145,90 +258,160 @@ shows that case on a map.
 encoding), with the cell size equal to the search radius so a query touches about 3×3 cells.
 
 - Results are **exact**: the grid only narrows the search and every hit is confirmed with
-  haversine. The property test `test_query_equals_linear_scan` checks this against a linear scan
-  on random inputs, including poles and the antimeridian.
+  haversine. Property tests compare queries with a linear scan on random inputs. Dedicated
+  strategies focus on the antimeridian, both poles, exact ±90/±180 values, zero radius and cells
+  larger than the globe. These tests found a real bug: inserts used `x // c` and queries used
+  `floor(x / c)`, which disagree by one cell when `x` falls exactly on a cell boundary. Both now
+  share one helper.
 - The square box around a circle means up to ~65 % of scanned points are false positives. That is
   cheap compared with scoring all *m*.
 - Cells are snapped to tile the globe, so columns wrap cleanly at ±180°. Near the poles the
   longitude span widens by `1/cos(lat)`, falling back to whole latitude bands.
-- If a query box covers more cells than are occupied (huge radius, tiny cells), the index walks
-  the occupied cells instead. It is never worse than a linear scan.
-- Fixed cells don't adapt to density. A single hotspot degrades toward O(m) per query. A quadtree
-  or H3 would adapt, but city-scale dispatch with a few-km radius doesn't need that complexity.
+- If a query box covers more cells than are occupied, the index walks the occupied cells instead.
+  It is never worse than a linear scan.
+- Fixed cells don't adapt to density. A quadtree or H3 would, but city-scale dispatch with a
+  few-km radius doesn't need that complexity.
 
 ## Benchmarks
 
 `python -m benchmarks.bench_assignment` generates random instances around Mexico City
-(pulsers = 1.5 × orders, random rating/load/vehicle, seed 42). It asserts that the grid finds
-exactly the same candidate pairs as all-pairs scoring, and that the component-split service
-matches as many orders as the monolithic Hungarian. Columns: *hungarian/greedy ms* are the solver
-alone on the full matrix. *service ms* is the end-to-end `assign_batch` (grid + components +
-Hungarian + building response models). *greedy gap* is the greedy average cost per matched order
-relative to Hungarian.
+(pulsers = 1.5 × orders, random rating/load/vehicle, seed 42). Timings are the **best of 3**. It
+asserts four things:
 
-Measured on an Intel i9-9980HK (2.4 GHz), CPython 3.14, single thread. Expect ±20 % run to run.
+- The grid finds exactly the same candidate pairs as all-pairs scoring.
+- Both Hungarian variants agree.
+- The component-split service matches as many orders as one monolithic solve.
+- The capacity-aware service matches at least that many.
+
+The columns are:
+
+- **hungarian py / np / greedy:** each solver alone on the full one-order-per-pulser matrix.
+- **service:** end-to-end `assign_batch` with one slot per pulser (grid, cache, components,
+  Hungarian, response models).
+- **cap-aware:** the default capacity-aware service.
+- **greedy gap:** greedy's average cost per matched order relative to Hungarian.
+
+Measured on an Intel i9-9980HK (8 cores / 16 threads), CPython 3.14, NumPy 2.5. **The machine was
+shared** and the load average was 15–19 during these runs, so absolute numbers are pessimistic.
+Treat the ratios as the result.
 
 **Dense city: 33 × 33 km** (`--sizes 50 100 200 400 800`)
 
-| orders | pulsers | feasible pairs | components | grid ms | all-pairs ms | hungarian ms | greedy ms | service ms | matched H / G | avg cost H / G | greedy gap |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|
-| 50 | 75 | 559 | 1 | 3.3 | 5.8 | 1.8 | 0.3 | 6.0 | 50 / 50 | 0.2568 / 0.2657 | +3.5 % |
-| 100 | 150 | 2318 | 1 | 11.5 | 24.7 | 6.9 | 1.8 | 21.7 | 100 / 100 | 0.2095 / 0.2160 | +3.1 % |
-| 200 | 300 | 9328 | 1 | 45.5 | 100.2 | 35.1 | 7.0 | 94.7 | 200 / 200 | 0.1723 / 0.1810 | +5.0 % |
-| 400 | 600 | 35823 | 1 | 187.0 | 392.0 | 172.6 | 26.2 | 394.3 | 400 / 400 | 0.1448 / 0.1513 | +4.5 % |
-| 800 | 1200 | 143317 | 1 | 738.6 | 1616.9 | 1006.2 | 161.3 | 2099.9 | 800 / 800 | 0.1296 / 0.1355 | +4.6 % |
+| orders | pulsers | feasible pairs | components | grid ms | all-pairs ms | hungarian py ms | hungarian np ms | greedy ms | service ms | cap-aware ms | matched H / G / cap | avg cost H / G | greedy gap |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|
+| 50 | 75 | 559 | 1 | 3.8 | 12.6 | 3.4 | 4.3 | 0.6 | 9.8 | 9.8 | 50 / 50 / 50 | 0.2568 / 0.2657 | +3.5 % |
+| 100 | 150 | 2318 | 1 | 14.3 | 51.2 | 12.6 | 9.5 | 2.8 | 27.1 | 27.9 | 100 / 100 / 100 | 0.2095 / 0.2160 | +3.1 % |
+| 200 | 300 | 9328 | 1 | 55.6 | 209.4 | 64.7 | 28.2 | 12.4 | 97.2 | 98.9 | 200 / 200 / 200 | 0.1723 / 0.1810 | +5.0 % |
+| 400 | 600 | 35823 | 1 | 198.2 | 795.4 | 279.9 | 79.8 | 44.5 | 297.9 | 307.3 | 400 / 400 / 400 | 0.1448 / 0.1513 | +4.5 % |
+| 800 | 1200 | 143317 | 1 | 745.5 | 2505.2 | 1197.1 | 219.0 | 183.8 | 889.5 | 888.9 | 800 / 800 / 800 | 0.1296 / 0.1355 | +4.6 % |
 
 **Sparse metro area: 150 × 150 km** (`--sizes 200 800 2000 --side-km 150`)
 
-| orders | pulsers | feasible pairs | components | grid ms | all-pairs ms | hungarian ms | greedy ms | service ms | matched H / G | avg cost H / G | greedy gap |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|
-| 200 | 300 | 477 | 45 | 4.9 | 94.7 | 114.9 | 1.7 | 8.6 | 159 / 144 | 0.3670 / 0.3434 | −6.4 % |
-| 800 | 1200 | 8223 | 1 | 59.1 | 1520.0 | 716.7 | 53.6 | 1392.8 | 799 / 762 | 0.2760 / 0.2676 | −3.0 % |
-| 2000 | 3000 | 51461 | 1 | 829.0 | 10755.2 | 5695.6 | 263.2 | 4519.5 | 2000 / 1989 | 0.2065 / 0.2148 | +4.0 % |
+| orders | pulsers | feasible pairs | components | grid ms | all-pairs ms | hungarian py ms | hungarian np ms | greedy ms | service ms | cap-aware ms | matched H / G / cap | avg cost H / G | greedy gap |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|
+| 200 | 300 | 477 | 45 | 3.7 | 89.5 | 114.2 | 42.8 | 2.0 | 16.0 | 16.9 | 159 / 144 / 172 | 0.3670 / 0.3434 | −6.4 % |
+| 800 | 1200 | 8223 | 1 | 42.8 | 1418.7 | 566.5 | 108.3 | 38.8 | 134.2 | 131.5 | 799 / 762 / 800 | 0.2760 / 0.2676 | −3.0 % |
+| 2000 | 3000 | 51461 | 1 | 235.9 | 8675.5 | 7240.1 | 892.6 | 478.9 | 1018.5 | 1238.9 | 2000 / 1989 / 2000 | 0.2065 / 0.2148 | +4.0 % |
 
 What the numbers say:
 
-- **Quality.** When everyone can be matched, greedy costs about 3–5 % more per order than
-  Hungarian. In sparse areas the bigger difference is coverage: greedy left **37 of 800** orders
-  unassigned that Hungarian matched. Its average cost looks *lower* there only because it skipped
-  the hard orders.
-- **Grid pre-filter.** In a dense city about a quarter of all pairs are within 8 km, so the grid
-  wins about 2×. In the sparse area it wins **13–26×**, because it skips pairs that could never be
-  feasible.
-- **Components.** At low density the candidate graph breaks into 45 independent pieces, and the
-  end-to-end service (8.6 ms) beats the monolithic Hungarian on the same matrix (115 ms) by 13×.
-  Once density passes the percolation threshold, a single giant component forms and the split
-  stops helping.
-- **Pure Python limit.** Hungarian is about 1 s at 800 × 1200 and about 6 s at 2000 × 3000. For a
-  dispatch tick with thousands of orders you would run it per zone (the component split does this
-  naturally when the radius is small), cap batch size, or swap in `scipy.optimize.linear_sum_assignment`
-  (C, same O(n³)). The pure implementation is kept because showing the algorithm is the point.
+- **NumPy Hungarian.** On tiny matrices it ties with or slightly loses to pure Python (array
+  overhead). At 400+ it is 3.5–8× faster: 1.2 s → 0.22 s at 800 × 1200 and 7.2 s → 0.9 s at
+  2000 × 3000.
+- **Quality.** When everyone can be matched, greedy costs 3–5 % more per order. In sparse areas
+  the bigger difference is coverage: greedy left 37 of 800 orders unassigned that Hungarian
+  matched. Greedy's average looks *lower* there only because it skipped the hard orders.
+- **Capacity.** Letting pulsers take several orders raises coverage in sparse areas (159 → 172
+  of 200; 799 → 800). Thanks to the cache, it costs almost nothing extra.
+- **Grid pre-filter.** About 3–4× faster than all-pairs in a dense city and 24–37× faster in the
+  sparse area.
+- **End to end.** At 800 × 1200 the one-slot service went from ~2.1 s in the first version (pure
+  Hungarian, re-scoring every pair) to ~0.9 s. In the sparse 200-order case the 45-component
+  split solves in 16 ms, against 43–114 ms for one solve over the whole matrix.
+
+## Load test
+
+`benchmarks/loadtest.py` is a closed-loop asyncio + httpx client. Each of `--concurrency` workers
+sends a request and immediately sends the next one when the answer arrives. Payloads are
+pre-encoded, and the workers are spread across `--processes` client processes. The first version
+used a single client process and saturated one core at ~150 req/s of 30 KB bodies, so it was
+measuring itself. Payloads are random Mexico City instances of the given size.
+
+```bash
+uvicorn pulso_matching.main:app --workers 4 --no-access-log &
+python -m benchmarks.loadtest --header --endpoint batch --orders 50 --pulsers 75 --concurrency 16
+```
+
+Same shared machine as above, 15 s per row, client and server on the same box, default settings
+(300 ms Hungarian budget, 2 s request timeout). *errors* are 504s.
+
+**1 uvicorn worker**
+
+| endpoint | size | strategy | concurrency | requests | req/s | p50 ms | p95 ms | p99 ms | mean ms | errors | degraded |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| /match | 1 x 200 | - | 16 | 1459 | 96.9 | 138.4 | 312.4 | 365.7 | 164.9 | 0 | 0 |
+| /match/batch | 50 x 75 | hungarian | 8 | 682 | 44.6 | 156.5 | 315.7 | 402.7 | 178.9 | 0 | 0 |
+| /match/batch | 50 x 75 | greedy | 8 | 664 | 43.9 | 162.2 | 286.5 | 336.6 | 181.6 | 0 | 0 |
+| /match/batch | 200 x 300 | hungarian | 4 | 76 | 4.9 | 744.2 | 1248.3 | 1294.4 | 809.7 | 0 | 76 |
+| /match/batch | 500 x 750 | hungarian | 4 | 28 | 1.8 | 2229.6 | 2338.4 | 2342.6 | 2235.7 | 28 | 0 |
+
+**4 uvicorn workers**
+
+| endpoint | size | strategy | concurrency | requests | req/s | p50 ms | p95 ms | p99 ms | mean ms | errors | degraded |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| /match | 1 x 200 | - | 32 | 5224 | 346.7 | 89.2 | 167.6 | 209.0 | 92.0 | 0 | 0 |
+| /match/batch | 50 x 75 | hungarian | 16 | 2177 | 144.0 | 95.5 | 218.9 | 262.9 | 110.7 | 0 | 0 |
+| /match/batch | 200 x 300 | hungarian | 8 | 362 | 23.6 | 358.8 | 518.5 | 598.2 | 334.3 | 0 | 193 |
+
+What the load test taught:
+
+- **At small batch sizes, the solver is not the bottleneck.** Hungarian and greedy give the same
+  throughput for 50 × 75. The time goes into JSON parsing, pydantic validation and scoring. Going
+  further would mean `orjson` responses, or moving validation off the event loop.
+- **Workers scale roughly linearly** (3.2–4.8× with 4 workers) until client and server compete
+  for the same 8 cores. An earlier run on a quieter machine reached 191 req/s (1 worker) and
+  577 req/s (4 workers) on `/match`.
+- **The budget works as load shedding.** A lone 200 × 300 batch solves in ~100 ms, but with four
+  concurrent batches sharing the GIL, the wall-clock budget runs out. Every batch was
+  `degraded`, which kept p99 under 1.3 s instead of letting it grow with the queue.
+- **500 × 750 at concurrency 4 does not fit in a 2 s timeout on one worker**, and every request
+  got a 504. This exposed a bug: the first runs returned those 504s at p50 2.9 s / p99 3.6 s,
+  because abandoned threads kept scoring and running greedy, holding the GIL the event loop
+  needed to send the 504. With cooperative deadlines in the service, 504s arrive at
+  p50 2.2 s / p99 2.3 s, even with more background load. The remaining ~0.2 s over the timeout is
+  most likely request-body parsing and validation, which run on the event loop before the timeout
+  starts.
 
 ## Decisions and trade-offs
 
-- **One order per pulser per batch.** A batch is one dispatch tick. Once a pulser accepts, their
-  load changes, and so does their score for everything else. Giving several orders to one pulser
-  in the same tick would mean expanding them into capacity slots with load-dependent costs. That
-  is possible (add one column per free slot), but it multiplies *m* and the Hungarian cost with it.
 - **Maximise coverage before cost.** An unassigned order is worse for the business than a slightly
   slower pickup, so the `BIG` penalty makes the Hungarian objective lexicographic.
-- **Cost, not score, inside the algorithms.** Minimising a `[0, 1]` cost keeps the solvers generic,
-  and the API reports `score = 1 − cost` because humans read "higher is better".
-- **Stateless service.** Pulser state comes in the request, so there is no stale cache to manage
-  and scaling out is trivial. A production version would read pulser positions from a live store.
-- **Straight-line ETA.** Haversine × road factor ÷ vehicle speed is a cheap, monotonic proxy.
-  A routing engine (OSRM/Valhalla) would be more accurate but adds a network hop for every pair,
-  so it fits better as a re-ranking step on the top-k only.
+- **Slots instead of a min-cost-flow solver.** Expanding capacity into columns keeps one solver
+  and its tests. The price is a matrix that grows with Σ slots, which is why the per-batch cap
+  exists.
+- **Pure + NumPy Hungarian.** The pure version is the readable reference the tests trust, and
+  NumPy is what production runs. `scipy.optimize.linear_sum_assignment` (C) would be faster
+  still, but it has no deadline hook, and showing the algorithm is the point here.
+- **Wall-clock budget, not an operation count.** It degrades exactly when latency is at risk,
+  including under contention. The trade-off is that results depend on load: the same request can
+  be optimal at 3 a.m. and greedy at noon. The response always says which happened.
+- **Threads + cooperative deadline for timeouts.** A process pool could kill runaway work, but it
+  would pay pickling and IPC on every request. Threads are cheap, and the deadline checks bound
+  the leftover work.
+- **Stateless service.** Pulser state comes in the request, so there is no stale cache and
+  scaling out is trivial. A production version would read positions from a live store.
+- **Straight-line ETA.** Haversine × road factor ÷ vehicle speed is a cheap, monotonic proxy. A
+  routing engine (OSRM/Valhalla) fits better as a re-ranking step on the top-k only.
 - **Structured logs.** Every request carries an `x-request-id` (generated if absent) that is bound
   into all log lines. Domain events use the shared Pulso names (`pulser.assigned` at debug level,
-  `assignment.failed`) plus a `batch.matched` summary.
+  `assignment.failed`) plus `batch.matched` and `batch.degraded`.
 
 ## Running it
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-uvicorn pulso_matching.main:app --reload          # http://localhost:8000/docs
+uvicorn pulso_matching.main:app --reload               # http://localhost:8000/docs
 PULSO_LOG_JSON=false uvicorn pulso_matching.main:app   # human-readable logs
 ```
 
@@ -236,7 +419,7 @@ Docker (multi-stage, `python:3.14-slim`, non-root user, healthcheck):
 
 ```bash
 docker build -t pulso-matching .
-docker run -p 8000:8000 -e PULSO_MAX_RADIUS_KM=6 pulso-matching
+docker run -p 8000:8000 -e PULSO_HUNGARIAN_BUDGET_MS=150 pulso-matching
 ```
 
 ## Testing
@@ -244,35 +427,35 @@ docker run -p 8000:8000 -e PULSO_MAX_RADIUS_KM=6 pulso-matching
 ```bash
 ruff check . && ruff format --check .
 mypy                     # strict, src + tests + benchmarks
-pytest                   # 49 tests, warnings are errors
+pytest                   # 90 tests, warnings are errors
 python -m benchmarks.bench_assignment --sizes 50 100 200 400
 ```
 
-- `test_geo.py`: known city-to-city distances, symmetry, bounds, and the triangle inequality
-  (Hypothesis).
-- `test_assignment.py`: Hungarian equals brute force (max cardinality, then min cost) on
-  hundreds of random matrices up to 6 × 6, with infeasible pairs and negative costs. Greedy is
-  always valid and never beats the optimum. A hand-built case shows greedy losing.
-- `test_spatial.py`: grid queries equal a linear scan for random points, radii and cell sizes,
-  plus the antimeridian.
-- `test_service.py`: ranking order, component split, invariants on a random city, and grid
-  candidates equal to all-pairs.
-- `test_api.py`: httpx `TestClient` for every endpoint, camelCase contract, 422 validation,
-  settings overrides, and request-id echo.
+| File | Tests | Highlights |
+|---|---:|---|
+| `test_geo.py` | 7 | known city distances; symmetry, bounds, triangle inequality (Hypothesis) |
+| `test_scoring.py` | 12 | component monotonicity, weights, vectorised = scalar slot costs, cache = from-scratch |
+| `test_assignment.py` | 16 | both Hungarians = brute force (with infeasible pairs, negative costs); NumPy = reference up to 40 × 40; greedy never beats optimum; deadline |
+| `test_spatial.py` | 14 | grid = linear scan (random, antimeridian, poles, ±90/±180, zero radius, huge cells); cell-boundary regression |
+| `test_service.py` | 16 | capacity-aware Hungarian = brute force over mappings and slot orders; budget → greedy on same matrix; request deadline stops work |
+| `test_api.py` | 25 | every endpoint via httpx `TestClient`, problem+json for 404/405/422/500/504, OpenAPI examples valid, metrics deltas, degradation flag |
 
 CI (`.github/workflows/ci.yml`) runs lint, mypy and tests on Python 3.12 and 3.14, plus a
 benchmark smoke run. It then builds the Docker image and probes `/health` in a running container.
 
 ## What this demonstrates
 
-- Implementing a classic combinatorial optimisation algorithm (Hungarian, O(n²m)) from scratch,
-  with a clear argument for correctness and property-based verification against brute force.
-- Choosing and measuring baselines: a greedy heap algorithm, its failure modes, and a reproducible
-  benchmark that reports quality as well as speed.
-- Spatial indexing for geo workloads and its trade-offs (exactness, poles, antimeridian, density).
-- Graph decomposition (union-find components) to turn one big problem into many small ones.
-- A typed Python service: FastAPI, pydantic v2 models and settings, `mypy --strict`, ruff,
-  structured JSON logging with request correlation.
+- A classic combinatorial optimisation algorithm (Hungarian, O(n²m)) implemented from scratch,
+  then vectorised with NumPy, with both verified against brute force.
+- Reducing a many-to-one problem (capacity) to one-to-one assignment, with a correctness argument
+  and a brute-force property test.
+- Performance work driven by measurement: a pair-term cache, vectorised matrix construction,
+  spatial indexing and component decomposition, each shown in the benchmark tables.
+- Production behaviour under load: time budgets with graceful degradation, per-request timeouts
+  with cooperative cancellation, and a load test that found a real tail-latency bug.
+- Property-based testing that pays for itself: Hypothesis found a cell-boundary bug in the grid.
+- Typed, observable services: FastAPI, pydantic v2, `mypy --strict`, Prometheus metrics,
+  RFC 9457 errors, structured JSON logs with request correlation.
 - Production hygiene: pinned dependencies, slim non-root Docker image with healthcheck, CI
   covering lint, types, tests and the container.
 

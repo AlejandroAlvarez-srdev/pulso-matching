@@ -89,10 +89,22 @@ def make_instance(
     return orders, pulsers
 
 
+REPEAT = 1
+
+
 def timed[T](fn: Callable[[], T]) -> tuple[T, float]:
-    started = time.perf_counter()
-    result = fn()
-    return result, (time.perf_counter() - started) * 1000
+    """Run ``fn`` REPEAT times; return its result and the fastest wall time in ms.
+
+    The minimum is the least noisy estimate on a shared machine: other load only adds time.
+    """
+    best = math.inf
+    result: T | None = None
+    for _ in range(REPEAT):
+        started = time.perf_counter()
+        result = fn()
+        best = min(best, (time.perf_counter() - started) * 1000)
+    assert result is not None
+    return result, best
 
 
 def solve_cost(matrix: CostMatrix, pairs: Pairs) -> float:
@@ -175,8 +187,11 @@ def main() -> None:
     parser.add_argument("--ratio", type=float, default=1.5, help="pulsers per order")
     parser.add_argument("--side-km", type=float, default=33.0, help="side of the square area")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--repeat", type=int, default=3, help="timings report the best of N")
     args = parser.parse_args()
 
+    global REPEAT
+    REPEAT = max(1, args.repeat)
     configure_logging("WARNING")
     rng = random.Random(args.seed)
     print(
