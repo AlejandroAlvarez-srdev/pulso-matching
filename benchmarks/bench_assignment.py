@@ -16,7 +16,13 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from pulso_matching.assignment import CostMatrix, Pairs, greedy_assignment, hungarian_assignment
+from pulso_matching.assignment import (
+    CostMatrix,
+    Pairs,
+    greedy_assignment,
+    hungarian_assignment,
+    hungarian_assignment_np,
+)
 from pulso_matching.config import Settings
 from pulso_matching.logging_config import configure_logging
 from pulso_matching.models import Location, Order, Place, Pulser, Strategy, Vehicle
@@ -35,6 +41,7 @@ class Row:
     grid_ms: float
     all_pairs_ms: float
     hungarian_ms: float
+    hungarian_np_ms: float
     greedy_ms: float
     service_ms: float
     components: int
@@ -126,6 +133,9 @@ def run(n: int, ratio: float, side_km: float, rng: random.Random) -> Row:
         [e.cost if (e := edges.get((i, j))) else None for j in range(m)] for i in range(n)
     ]
     h_pairs, h_ms = timed(lambda: hungarian_assignment(matrix))
+    np_pairs, np_ms = timed(lambda: hungarian_assignment_np(matrix))
+    assert len(np_pairs) == len(h_pairs)
+    assert math.isclose(solve_cost(matrix, np_pairs), solve_cost(matrix, h_pairs), abs_tol=1e-6)
     g_pairs, g_ms = timed(lambda: greedy_assignment(matrix))
     # End to end: grid + connected components + Hungarian per component.
     batch, service_ms = timed(lambda: service.assign_batch(orders, pulsers, Strategy.HUNGARIAN))
@@ -137,6 +147,7 @@ def run(n: int, ratio: float, side_km: float, rng: random.Random) -> Row:
         grid_ms=grid_ms,
         all_pairs_ms=all_pairs_ms,
         hungarian_ms=h_ms,
+        hungarian_np_ms=np_ms,
         greedy_ms=g_ms,
         service_ms=service_ms,
         components=_count_components(edges, n),
@@ -159,9 +170,10 @@ def main() -> None:
     rng = random.Random(args.seed)
     print(
         "| orders | pulsers | feasible pairs | components | grid ms | all-pairs ms "
-        "| hungarian ms | greedy ms | service ms | matched H / G | avg cost H / G | greedy gap |"
+        "| hungarian py ms | hungarian np ms | greedy ms | service ms "
+        "| matched H / G | avg cost H / G | greedy gap |"
     )
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|")
     for n in args.sizes:
         r = run(n, args.ratio, args.side_km, rng)
         avg_h = r.hungarian_cost / max(r.hungarian_matched, 1)
@@ -169,7 +181,8 @@ def main() -> None:
         gap = (avg_g - avg_h) / avg_h * 100 if avg_h else 0.0
         print(
             f"| {r.n} | {r.m} | {r.pairs} | {r.components} | {r.grid_ms:.1f} "
-            f"| {r.all_pairs_ms:.1f} | {r.hungarian_ms:.1f} | {r.greedy_ms:.1f} "
+            f"| {r.all_pairs_ms:.1f} | {r.hungarian_ms:.1f} | {r.hungarian_np_ms:.1f} "
+            f"| {r.greedy_ms:.1f} "
             f"| {r.service_ms:.1f} "
             f"| {r.hungarian_matched} / {r.greedy_matched} "
             f"| {avg_h:.4f} / {avg_g:.4f} | {gap:+.1f} % |"

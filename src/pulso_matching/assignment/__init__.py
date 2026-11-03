@@ -7,6 +7,20 @@ column appears at most once.
 
 from pulso_matching.assignment.greedy import greedy_assignment
 from pulso_matching.assignment.hungarian import hungarian_assignment
-from pulso_matching.assignment.types import CostMatrix, Pairs
+from pulso_matching.assignment.hungarian_np import (
+    BudgetExceededError,
+    hungarian_assignment_np,
+    to_float_matrix,
+)
+from pulso_matching.assignment.types import CostMatrix, FloatMatrix, Pairs
 
-__all__ = ["CostMatrix", "Pairs", "greedy_assignment", "hungarian_assignment"]
+__all__ = [
+    "BudgetExceededError",
+    "CostMatrix",
+    "FloatMatrix",
+    "Pairs",
+    "greedy_assignment",
+    "hungarian_assignment",
+    "hungarian_assignment_np",
+    "to_float_matrix",
+]

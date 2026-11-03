@@ -1,16 +1,21 @@
 import itertools
 import math
+import random
 from collections.abc import Callable
 
+import numpy as np
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from pulso_matching.assignment import (
+    BudgetExceededError,
     CostMatrix,
     Pairs,
     greedy_assignment,
     hungarian_assignment,
+    hungarian_assignment_np,
+    to_float_matrix,
 )
 
 
@@ -87,7 +92,9 @@ def test_greedy_can_lose_cardinality_hungarian_does_not() -> None:
     assert hungarian_assignment(cost) == [(0, 1), (1, 0)]
 
 
-@pytest.mark.parametrize("solver", [hungarian_assignment, greedy_assignment])
+@pytest.mark.parametrize(
+    "solver", [hungarian_assignment, hungarian_assignment_np, greedy_assignment]
+)
 def test_rectangular_and_degenerate(solver: Callable[[CostMatrix], Pairs]) -> None:
     assert solver([]) == []
     assert solver([[None, None], [None, None]]) == []
@@ -97,9 +104,26 @@ def test_rectangular_and_degenerate(solver: Callable[[CostMatrix], Pairs]) -> No
     assert solver(tall) == [(1, 0)]
 
 
-def test_rejects_ragged_matrix() -> None:
+@pytest.mark.parametrize("solver", [hungarian_assignment, hungarian_assignment_np])
+def test_rejects_ragged_matrix(solver: Callable[[CostMatrix], Pairs]) -> None:
     with pytest.raises(ValueError, match="rectangular"):
-        hungarian_assignment([[1, 2], [3]])
+        solver([[1, 2], [3]])
+
+
+def test_numpy_accepts_ndarray_with_inf_and_nan_as_infeasible() -> None:
+    cost = np.array([[1.0, 5.0], [3.0, np.inf], [np.nan, 0.5]])
+    assert hungarian_assignment_np(cost) == hungarian_assignment([[1, 5], [3, None], [None, 0.5]])
+
+
+def test_numpy_deadline_in_the_past_raises() -> None:
+    with pytest.raises(BudgetExceededError):
+        hungarian_assignment_np([[1.0, 2.0], [3.0, 4.0]], deadline=0.0)
+
+
+def test_to_float_matrix_marks_none_as_inf() -> None:
+    out = to_float_matrix([[1.0, None]])
+    assert out[0, 0] == 1.0
+    assert np.isinf(out[0, 1])
 
 
 @settings(max_examples=300, deadline=None)
@@ -132,3 +156,30 @@ def test_greedy_is_valid_and_never_beats_optimum_on_dense(cost: list[list[float 
     assert_valid(cost, pairs)
     assert len(pairs) == min(len(cost), len(cost[0]) if cost else 0)
     assert total(cost, pairs) >= total(cost, hungarian_assignment(cost)) - 1e-6
+
+
+@settings(max_examples=300, deadline=None)
+@given(matrices())
+def test_numpy_variant_matches_brute_force(cost: list[list[float | None]]) -> None:
+    pairs = hungarian_assignment_np(cost)
+    assert_valid(cost, pairs)
+    best_count, best_cost = brute_force(cost)
+    assert len(pairs) == best_count
+    assert total(cost, pairs) == pytest.approx(best_cost, abs=1e-6)
+
+
+@settings(max_examples=50, deadline=None)
+@given(
+    st.integers(min_value=1, max_value=40),
+    st.integers(min_value=1, max_value=40),
+    st.randoms(use_true_random=False),
+)
+def test_numpy_variant_agrees_with_reference_on_larger_instances(
+    n: int, m: int, rnd: random.Random
+) -> None:
+    cost: list[list[float | None]] = [
+        [None if rnd.random() < 0.3 else rnd.uniform(0, 1) for _ in range(m)] for _ in range(n)
+    ]
+    ref, fast = hungarian_assignment(cost), hungarian_assignment_np(cost)
+    assert len(ref) == len(fast)
+    assert total(cost, fast) == pytest.approx(total(cost, ref), abs=1e-9)

@@ -25,14 +25,14 @@ from uuid import UUID
 
 import structlog
 
-from pulso_matching.assignment import CostMatrix, greedy_assignment, hungarian_assignment
+from pulso_matching.assignment import CostMatrix, greedy_assignment, hungarian_assignment_np
 from pulso_matching.models import Assignment, Candidate, Order, Pulser, Strategy
 from pulso_matching.scoring import PairScore, Scorer
 from pulso_matching.spatial import GridIndex
 
 log = structlog.get_logger(__name__)
 
-SOLVERS = {Strategy.HUNGARIAN: hungarian_assignment, Strategy.GREEDY: greedy_assignment}
+SOLVERS = {Strategy.HUNGARIAN: hungarian_assignment_np, Strategy.GREEDY: greedy_assignment}
 
 
 @dataclass(frozen=True, slots=True)
