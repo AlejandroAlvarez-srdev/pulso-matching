@@ -202,3 +202,49 @@ def test_capacity_aware_hungarian_matches_brute_force(
     matched, cost = _brute_force_capacity(scorer, orders, pulsers)
     assert len(result.assignments) == matched
     assert len(result.assignments) - result.total_score == pytest.approx(cost, abs=1e-4)
+
+
+def _random_city(seed: int, n: int, m: int) -> tuple[list[Order], list[Pulser]]:
+    rng = random.Random(seed)
+
+    def jitter() -> tuple[float, float]:
+        return CDMX[0] + rng.uniform(-0.1, 0.1), CDMX[1] + rng.uniform(-0.1, 0.1)
+
+    return [make_order(*jitter()) for _ in range(n)], [
+        make_pulser(f"p{k}", *jitter(), max_tasks=1) for k in range(m)
+    ]
+
+
+def test_exhausted_budget_degrades_to_greedy_on_the_same_matrix() -> None:
+    orders, pulsers = _random_city(3, 30, 40)
+    scorer = Scorer(Settings())
+    starved = MatchingService(scorer, hungarian_budget_ms=1e-9)
+    result = starved.assign_batch(orders, pulsers, Strategy.HUNGARIAN)
+    greedy = MatchingService(scorer).assign_batch(orders, pulsers, Strategy.GREEDY)
+    assert result.degraded
+    assert result.degraded_components >= 1
+    pairs = {(a.order_id, a.pulser_id) for a in result.assignments}
+    assert pairs == {(a.order_id, a.pulser_id) for a in greedy.assignments}
+
+
+def test_request_deadline_also_caps_hungarian() -> None:
+    orders, pulsers = _random_city(4, 10, 10)
+    service = MatchingService(Scorer(Settings()))
+    result = service.assign_batch(orders, pulsers, Strategy.HUNGARIAN, deadline=0.0)
+    assert result.degraded
+
+
+def test_generous_budget_keeps_the_optimum() -> None:
+    orders, pulsers = _random_city(5, 30, 40)
+    scorer = Scorer(Settings())
+    budgeted = MatchingService(scorer, hungarian_budget_ms=60_000)
+    result = budgeted.assign_batch(orders, pulsers, Strategy.HUNGARIAN)
+    unbounded = MatchingService(scorer).assign_batch(orders, pulsers, Strategy.HUNGARIAN)
+    assert not result.degraded
+    assert result.total_score == pytest.approx(unbounded.total_score)
+
+
+def test_greedy_strategy_is_never_reported_as_degraded() -> None:
+    orders, pulsers = _random_city(6, 10, 10)
+    starved = MatchingService(Scorer(Settings()), hungarian_budget_ms=1e-9)
+    assert not starved.assign_batch(orders, pulsers, Strategy.GREEDY).degraded

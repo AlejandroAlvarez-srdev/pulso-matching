@@ -17,6 +17,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from pulso_matching.timeouts import RequestTimeoutError
+
 PROBLEM_JSON = "application/problem+json"
 PROBLEM_BASE = "https://errors.pulso.example/"
 
@@ -113,6 +115,19 @@ def install_problem_handlers(app: FastAPI) -> None:
                 instance=request.url.path,
             ),
             headers=dict(exc.headers) if exc.headers else None,
+        )
+
+    @app.exception_handler(RequestTimeoutError)
+    async def on_timeout(request: Request, exc: RequestTimeoutError) -> JSONResponse:
+        log.warning("http.timeout", path=request.url.path, timeout_ms=exc.timeout_ms)
+        return problem_response(
+            Problem(
+                type=PROBLEM_BASE + "timeout",
+                title="Matching timed out",
+                status=504,
+                detail=str(exc),
+                instance=request.url.path,
+            )
         )
 
     @app.exception_handler(Exception)

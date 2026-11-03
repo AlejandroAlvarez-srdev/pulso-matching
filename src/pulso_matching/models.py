@@ -108,3 +108,8 @@ class BatchMatchResponse(CamelModel):
     unassigned_order_ids: list[UUID]
     total_score: float
     elapsed_ms: float
+    degraded: bool = Field(
+        default=False,
+        description="True when the Hungarian budget ran out and some components used greedy.",
+    )
+    degraded_components: int = 0

@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     max_orders_per_pulser_per_batch: int = Field(default=3, ge=1)
     stacked_order_delay_minutes: float = Field(default=12.0, ge=0)
 
+    # Wall-clock budget for Hungarian per batch; past it the batch degrades to greedy.
+    hungarian_budget_ms: float = Field(default=300.0, gt=0)
+    # Hard limit for a whole request; past it the client gets a 504 problem+json.
+    request_timeout_ms: float = Field(default=2000.0, gt=0)
+
     log_level: str = "INFO"
     log_json: bool = True
 

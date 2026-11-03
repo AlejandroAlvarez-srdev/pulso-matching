@@ -1,3 +1,4 @@
+import time
 from collections.abc import Iterator
 from typing import Any
 from uuid import uuid4
@@ -10,7 +11,8 @@ from pulso_matching.config import Settings, get_settings
 from pulso_matching.examples import BATCH_EXAMPLES, MATCH_EXAMPLES
 from pulso_matching.main import app, get_service
 from pulso_matching.problems import PROBLEM_JSON
-from pulso_matching.service import MatchingService
+from pulso_matching.scoring import Scorer
+from pulso_matching.service import BatchResult, MatchingService
 
 KM = 1 / 111.195
 CDMX = (19.4326, -99.1332)
@@ -215,3 +217,30 @@ def test_openapi_examples_are_valid_requests(
     for example in examples.values():
         res = client.post(path, json=example.get("value"))
         assert res.status_code == 200, res.text
+
+
+def test_batch_reports_degradation_when_budget_is_exhausted(client: TestClient) -> None:
+    app.dependency_overrides[get_settings] = lambda: Settings(hungarian_budget_ms=1e-9)
+    res = client.post("/match/batch", json={"orders": [order()], "pulsers": [pulser("p")]})
+    body = res.json()
+    assert res.status_code == 200
+    assert body["degraded"] is True
+    assert body["degradedComponents"] == 1
+    assert len(body["assignments"]) == 1
+
+
+def test_slow_request_returns_504_problem(client: TestClient) -> None:
+    class SlowService(MatchingService):
+        def assign_batch(self, *args: Any, **kwargs: Any) -> BatchResult:
+            time.sleep(0.5)
+            return super().assign_batch(*args, **kwargs)
+
+    settings = Settings(request_timeout_ms=50)
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_service] = lambda: SlowService(Scorer(settings))
+    started = time.perf_counter()
+    res = client.post("/match/batch", json={"orders": [order()], "pulsers": [pulser("p")]})
+    assert time.perf_counter() - started < 0.4
+    assert res.status_code == 504
+    assert res.headers["content-type"] == PROBLEM_JSON
+    assert res.json()["type"].endswith("/timeout")

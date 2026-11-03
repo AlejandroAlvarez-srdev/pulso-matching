@@ -23,12 +23,16 @@ from pulso_matching.models import (
 from pulso_matching.problems import install_problem_handlers, problem_responses
 from pulso_matching.scoring import Scorer
 from pulso_matching.service import MatchingService
+from pulso_matching.timeouts import deadline_in, run_with_timeout
 
 log = structlog.get_logger(__name__)
 
 
-def get_service(settings: Annotated[Settings, Depends(get_settings)]) -> MatchingService:
-    return MatchingService(Scorer(settings))
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+
+def get_service(settings: SettingsDep) -> MatchingService:
+    return MatchingService(Scorer(settings), hungarian_budget_ms=settings.hungarian_budget_ms)
 
 
 ServiceDep = Annotated[MatchingService, Depends(get_service)]
@@ -75,34 +79,49 @@ def create_app() -> FastAPI:
         "/match",
         response_model=MatchResponse,
         response_model_by_alias=True,
-        responses=problem_responses(422),
+        responses=problem_responses(422, 504),
     )
-    def match(
+    async def match(
         body: Annotated[MatchRequest, Body(openapi_examples=MATCH_EXAMPLES)],
         service: ServiceDep,
+        settings: SettingsDep,
     ) -> MatchResponse:
         """Rank pulsers for one order (best first)."""
-        candidates = service.rank(body.order, body.pulsers, body.limit)
+        candidates = await run_with_timeout(
+            lambda: service.rank(body.order, body.pulsers, body.limit), settings.request_timeout_ms
+        )
         return MatchResponse(order_id=body.order.id, candidates=candidates)
 
     @app.post(
         "/match/batch",
         response_model=BatchMatchResponse,
         response_model_by_alias=True,
-        responses=problem_responses(422),
+        responses=problem_responses(422, 504),
     )
-    def match_batch(
+    async def match_batch(
         body: Annotated[BatchMatchRequest, Body(openapi_examples=BATCH_EXAMPLES)],
         service: ServiceDep,
+        settings: SettingsDep,
     ) -> BatchMatchResponse:
-        """Assign N orders to M pulsers (one order per pulser) minimising total cost."""
-        result = service.assign_batch(body.orders, body.pulsers, body.strategy)
+        """Assign N orders to M pulsers (capacity-aware) minimising total cost.
+
+        Hungarian runs under ``PULSO_HUNGARIAN_BUDGET_MS``; past it the batch falls back to
+        greedy and ``degraded`` is true. Past ``PULSO_REQUEST_TIMEOUT_MS`` the request fails
+        with a 504 problem.
+        """
+        deadline = deadline_in(settings.request_timeout_ms)
+        result = await run_with_timeout(
+            lambda: service.assign_batch(body.orders, body.pulsers, body.strategy, deadline),
+            settings.request_timeout_ms,
+        )
         return BatchMatchResponse(
             strategy=body.strategy,
             assignments=result.assignments,
             unassigned_order_ids=result.unassigned_order_ids,
             total_score=result.total_score,
             elapsed_ms=result.elapsed_ms,
+            degraded=result.degraded,
+            degraded_components=result.degraded_components,
         )
 
     return app

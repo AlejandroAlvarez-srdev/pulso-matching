@@ -19,6 +19,15 @@ non-decreasing in ``k`` for every order (plus a ``k · 1e-9`` tie-breaker), so a
 always fills a pulser's slots in order, and a standard one-to-one assignment solves the
 many-to-one problem. The price is a wider matrix: ``m`` becomes ``Σ slots``, which Hungarian pays
 linearly (O(n² · Σ slots)).
+
+Time budget and graceful degradation
+------------------------------------
+Hungarian is O(n² · m); greedy is O(nm log nm) and typically 5-10x faster at dispatch sizes.
+With ``hungarian_budget_ms`` set, the Hungarian solver gets a wall-clock deadline (also capped by
+the caller's request deadline). Components are solved smallest first, so the cheap ones get the
+optimum; if the deadline passes mid-solve, that component and every remaining one are solved
+greedily **from the same cached cost matrix**, and the result is flagged ``degraded``. A slightly
+worse assignment returned in time beats an optimal one the dispatcher has already given up on.
 """
 
 from __future__ import annotations
@@ -33,7 +42,12 @@ from uuid import UUID
 import numpy as np
 import structlog
 
-from pulso_matching.assignment import FloatMatrix, greedy_assignment, hungarian_assignment_np
+from pulso_matching.assignment import (
+    BudgetExceededError,
+    FloatMatrix,
+    greedy_assignment,
+    hungarian_assignment_np,
+)
 from pulso_matching.models import Assignment, Candidate, Order, Pulser, Strategy
 from pulso_matching.scoring import PairTerms, Scorer
 from pulso_matching.spatial import GridIndex
@@ -42,8 +56,6 @@ log = structlog.get_logger(__name__)
 
 SLOT_TIE_BREAK = 1e-9
 
-SOLVERS = {Strategy.HUNGARIAN: hungarian_assignment_np, Strategy.GREEDY: greedy_assignment}
-
 
 @dataclass(frozen=True, slots=True)
 class BatchResult:
@@ -51,6 +63,11 @@ class BatchResult:
     unassigned_order_ids: list[UUID]
     total_score: float
     elapsed_ms: float
+    degraded_components: int = 0
+
+    @property
+    def degraded(self) -> bool:
+        return self.degraded_components > 0
 
 
 class _UnionFind:
@@ -68,8 +85,9 @@ class _UnionFind:
 
 
 class MatchingService:
-    def __init__(self, scorer: Scorer) -> None:
+    def __init__(self, scorer: Scorer, hungarian_budget_ms: float | None = None) -> None:
         self._scorer = scorer
+        self._hungarian_budget_ms = hungarian_budget_ms
 
     def rank(self, order: Order, pulsers: list[Pulser], limit: int) -> list[Candidate]:
         """Top-``limit`` candidates for one order. O(m log limit) with a bounded heap."""
@@ -151,9 +169,22 @@ class MatchingService:
         return matrix, cols
 
     def assign_batch(
-        self, orders: list[Order], pulsers: list[Pulser], strategy: Strategy
+        self,
+        orders: list[Order],
+        pulsers: list[Pulser],
+        strategy: Strategy,
+        deadline: float | None = None,
     ) -> BatchResult:
+        """Assign ``orders`` to ``pulsers``.
+
+        ``deadline`` is a :func:`time.perf_counter` timestamp after which nobody is waiting for
+        the answer; it caps the Hungarian budget (see the module docstring).
+        """
         started = time.perf_counter()
+        hungarian_deadline = deadline
+        if self._hungarian_budget_ms is not None:
+            budget_end = started + self._hungarian_budget_ms / 1000
+            hungarian_deadline = min(budget_end, deadline or budget_end)
         n = len(orders)
         edges = self.candidate_edges(orders, pulsers)
         adjacency: dict[int, list[int]] = defaultdict(list)
@@ -170,14 +201,26 @@ class MatchingService:
         for j in sorted({j for _, j in edges}):
             components[uf.find(n + j)][1].append(j)
 
-        solve = SOLVERS[strategy]
         now = datetime.now(UTC)
         assignments: list[Assignment] = []
-        for rows, pulser_cols in components.values():
+        degraded = 0
+        use_greedy = strategy is Strategy.GREEDY
+        for rows, pulser_cols in sorted(
+            components.values(), key=lambda rc: len(rc[0]) * len(rc[1])
+        ):
             if not pulser_cols:
                 continue
             matrix, cols = self._component_matrix(rows, pulser_cols, adjacency, edges, pulsers)
-            for r, c in solve(matrix):
+            pairs = None
+            if not use_greedy:
+                try:
+                    pairs = hungarian_assignment_np(matrix, deadline=hungarian_deadline)
+                except BudgetExceededError:
+                    use_greedy = True
+            if pairs is None:
+                pairs = greedy_assignment(matrix)
+                degraded += strategy is Strategy.HUNGARIAN
+            for r, c in pairs:
                 i, (j, k) = rows[r], cols[c]
                 pair = self._scorer.slot_score(edges[(i, j)], pulsers[j], k)
                 assert pair is not None  # the matrix entry was finite
@@ -201,6 +244,13 @@ class MatchingService:
             log.debug("pulser.assigned", order_id=str(a.order_id), pulser_id=a.pulser_id)
         for order_id in unassigned:
             log.info("assignment.failed", order_id=str(order_id), reason="no_feasible_pulser")
+        if degraded:
+            log.warning(
+                "batch.degraded",
+                budget_ms=self._hungarian_budget_ms,
+                degraded_components=degraded,
+                components=len(components),
+            )
         log.info(
             "batch.matched",
             strategy=strategy.value,
@@ -210,6 +260,7 @@ class MatchingService:
             components=len(components),
             assigned=len(assignments),
             unassigned=len(unassigned),
+            degraded_components=degraded,
             elapsed_ms=round(elapsed_ms, 2),
         )
         return BatchResult(
@@ -217,4 +268,5 @@ class MatchingService:
             unassigned_order_ids=unassigned,
             total_score=round(sum(a.score for a in assignments), 6),
             elapsed_ms=round(elapsed_ms, 3),
+            degraded_components=degraded,
         )
