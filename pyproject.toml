@@ -27,6 +27,7 @@ dev = [
     "mypy==2.4.1",
     "pytest==9.2.0",
     "ruff==0.17.3",
+    "scipy==1.18.1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -53,3 +54,8 @@ python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
 files = ["src", "tests", "benchmarks"]
+
+# SciPy is a dev-only oracle for differential tests and ships no type stubs.
+[[tool.mypy.overrides]]
+module = ["scipy", "scipy.*"]
+ignore_missing_imports = true
