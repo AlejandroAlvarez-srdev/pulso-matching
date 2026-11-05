@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/banner.svg" alt="pulso-matching" width="100%"></p>
 
-<p align="center"><a href="https://github.com/AlejandroAlvarez-srdev/pulso-matching/actions/workflows/ci.yml"><img src="https://github.com/AlejandroAlvarez-srdev/pulso-matching/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <img src="https://img.shields.io/badge/21_commitsFastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI"> <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"> <img src="https://img.shields.io/badge/NumPy-013243?style=for-the-badge&logo=numpy&logoColor=white" alt="NumPy"> <img src="https://img.shields.io/badge/Prometheus-E6522C?style=for-the-badge&logo=prometheus&logoColor=white" alt="Prometheus"> <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker"> <img src="https://img.shields.io/badge/GitHub_Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white" alt="GitHub Actions"> <img src="https://img.shields.io/badge/20_commits-6a178c?style=for-the-badge" alt="21 commits"></p>
+<p align="center"><a href="https://github.com/AlejandroAlvarez-srdev/pulso-matching/actions/workflows/ci.yml"><img src="https://github.com/AlejandroAlvarez-srdev/pulso-matching/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI"> <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"> <img src="https://img.shields.io/badge/NumPy-013243?style=for-the-badge&logo=numpy&logoColor=white" alt="NumPy"> <img src="https://img.shields.io/badge/Prometheus-E6522C?style=for-the-badge&logo=prometheus&logoColor=white" alt="Prometheus"> <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker"> <img src="https://img.shields.io/badge/GitHub_Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white" alt="GitHub Actions"> <img src="https://img.shields.io/badge/20_commits-6a178c?style=for-the-badge" alt="21 commits"></p>
 
 <h1 align="center">pulso-matching</h1>
 <!-- /header -->
@@ -25,7 +25,7 @@ It exposes Prometheus metrics, returns RFC 9457 errors, and enforces a per-reque
 
 <table>
   <tr>
-    <td align="center" width="25%"><b>90 incl. property-based</b><br>Tests</td>
+    <td align="center" width="25%"><b>182 incl. property-based</b><br>Tests</td>
     <td align="center" width="25%"><b>Hungarian vs brute force</b><br>Optimal</td>
     <td align="center" width="25%"><b>NumPy 3.5–8× faster</b><br>Speed</td>
     <td align="center" width="25%"><b>Budget → greedy fallback, 504 deadline</b><br>Resilience</td>
@@ -79,6 +79,7 @@ src/pulso_matching/
 │   ├── hungarian.py     pure-Python reference
 │   └── greedy.py        heap-based baseline
 ├── timeouts.py          per-request timeout + cooperative deadline
+├── limits.py            admission control: streamed body-size cap (413), list caps (422)
 ├── problems.py          RFC 9457 problem+json handlers
 ├── metrics.py           Prometheus registry
 ├── examples.py          OpenAPI request examples
@@ -146,7 +147,8 @@ route, wrong method, timeout and unhandled exceptions. A 500 never leaks the exc
 
 | Status | `type` | When |
 |---|---|---|
-| 422 | `…/validation` | body fails pydantic validation (`errors[]` per field) |
+| 413 | `…/payload-too-large` | body larger than `PULSO_MAX_BODY_BYTES` (sent with `connection: close`) |
+| 422 | `…/validation` | body fails pydantic validation, or more orders/pulsers than allowed (`errors[]` per field) |
 | 404 / 405 | `about:blank` | unknown route / wrong method |
 | 504 | `…/timeout` | request exceeded `PULSO_REQUEST_TIMEOUT_MS` |
 | 500 | `…/internal` | unhandled exception (logged with traceback) |
@@ -195,6 +197,8 @@ The weights are normalised to sum to 1. Every value is a `PULSO_*` env var (`con
 | `PULSO_STACKED_ORDER_DELAY_MINUTES` | 12 | extra ETA per order already stacked on the pulser |
 | `PULSO_HUNGARIAN_BUDGET_MS` | 300 | wall-clock budget before degrading to greedy |
 | `PULSO_REQUEST_TIMEOUT_MS` | 2000 | hard limit per request (504 past it) |
+| `PULSO_MAX_BODY_BYTES` | 4 MiB | body size cap, counted while streaming (413 past it) |
+| `PULSO_MAX_BATCH_ORDERS` / `PULSO_MAX_PULSERS` | 2000 / 5000 | list caps per request (422 past them) |
 | `PULSO_LOG_LEVEL`, `PULSO_LOG_JSON` | INFO, true | logging |
 
 ## Algorithms and complexity
@@ -222,7 +226,11 @@ picking the free column with `argmin`, shifting the potentials) done as O(m) Num
 operations. The Python loop runs once per tree-growth step instead of once per column. The
 complexity is unchanged, but the constants are 3.5–8× better from 400 orders up. It also takes a
 `perf_counter` deadline, checked once per inserted row. Property tests check both variants
-against brute force, and against each other on instances up to 40 × 40.
+against brute force, and against each other on instances up to 40 × 40. Because both of those
+oracles are this repo's own code, a differential suite also checks them against SciPy (a
+dev-only dependency) on rectangular instances up to 300 × 200 with 5–100 % feasible pairs and
+frequent ties: the match count must equal SciPy's Hopcroft–Karp maximum matching and the cost
+must equal `linear_sum_assignment`'s optimum over maximum matchings.
 
 **Greedy** (`assignment/greedy.py`) takes the globally cheapest free pair each time. It is fast,
 but it has no optimality guarantee for min-cost assignment, and it can strand an order by giving
@@ -264,6 +272,14 @@ optimal one the dispatcher has already given up on. So:
   which checks it per order while scoring, before each component, and per row inside Hungarian,
   so abandoned work stops instead of competing for the GIL. The load test found this was
   necessary (see below).
+- `PULSO_REQUEST_TIMEOUT_MS` only starts once the handler runs, i.e. after the body has been
+  read, decoded and validated on the event loop. **Admission control** (`limits.py`) bounds that
+  part: a pure ASGI middleware counts body bytes as they arrive and refuses with a 413 past
+  `PULSO_MAX_BODY_BYTES`. A declared `Content-Length` over the limit is refused before anything
+  is read, and a chunked or understated body is cut off on the chunk that crosses it, so a
+  client can't make the worker parse 100 MB of JSON. The order and pulser caps then bound the
+  solver (Hungarian is O(n²·M)). The defaults leave room for the largest benchmark below
+  (2000 × 3000): a pulser is ~190 bytes of JSON and an order ~115.
 - The budget is **wall-clock**, so under CPU contention more batches degrade. That is the
   intended load-shedding behaviour: when the box is busy, the service trades a few percent of
   assignment quality for latency rather than queueing.
@@ -396,7 +412,7 @@ What the load test taught:
   needed to send the 504. With cooperative deadlines in the service, 504s arrive at
   p50 2.2 s / p99 2.3 s, even with more background load. The remaining ~0.2 s over the timeout is
   most likely request-body parsing and validation, which run on the event loop before the timeout
-  starts.
+  starts. That work is now bounded by the body-size and list caps described above.
 
 ## Decisions and trade-offs
 
@@ -443,7 +459,7 @@ docker run -p 8000:8000 -e PULSO_HUNGARIAN_BUDGET_MS=150 pulso-matching
 ```bash
 ruff check . && ruff format --check .
 mypy                     # strict, src + tests + benchmarks
-pytest                   # 90 tests, warnings are errors
+pytest                   # 182 tests, warnings are errors
 python -m benchmarks.bench_assignment --sizes 50 100 200 400
 ```
 
@@ -454,6 +470,8 @@ python -m benchmarks.bench_assignment --sizes 50 100 200 400
 | `test_assignment.py` | 16 | both Hungarians = brute force (with infeasible pairs, negative costs); NumPy = reference up to 40 × 40; greedy never beats optimum; deadline |
 | `test_spatial.py` | 14 | grid = linear scan (random, antimeridian, poles, ±90/±180, zero radius, huge cells); cell-boundary regression |
 | `test_service.py` | 16 | capacity-aware Hungarian = brute force over mappings and slot orders; budget → greedy on same matrix; request deadline stops work |
+| `test_assignment_scipy.py` | 81 | differential tests vs SciPy up to 300 × 200: NumPy Hungarian = `linear_sum_assignment` cost and Hopcroft–Karp match count at densities 100 / 30 / 5 %; reference Hungarian too at 80 × 50; greedy never beats it |
+| `test_limits.py` | 11 | 413 problem past the body cap, at the ASGI level for chunked, understated and overstated `Content-Length` (counts the chunks actually read); 422 on `orders` / `pulsers` past the list caps; OpenAPI documents 413 |
 | `test_api.py` | 25 | every endpoint via httpx `TestClient`, problem+json for 404/405/422/500/504, OpenAPI examples valid, metrics deltas, degradation flag |
 
 CI (`.github/workflows/ci.yml`) runs lint, mypy and tests on Python 3.12 and 3.14, plus a
@@ -470,6 +488,7 @@ benchmark smoke run. It then builds the Docker image and probes `/health` in a r
 - Production behaviour under load: time budgets with graceful degradation, per-request timeouts
   with cooperative cancellation, and a load test that found a real tail-latency bug.
 - Property-based testing that pays for itself: Hypothesis found a cell-boundary bug in the grid.
+  Differential testing against an independent solver (SciPy) at sizes brute force can't reach.
 - Typed, observable services: FastAPI, pydantic v2, `mypy --strict`, Prometheus metrics,
   RFC 9457 errors, structured JSON logs with request correlation.
 - Production hygiene: pinned dependencies, slim non-root Docker image with healthcheck, CI
