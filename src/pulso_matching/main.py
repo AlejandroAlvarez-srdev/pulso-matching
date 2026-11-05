@@ -14,6 +14,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pulso_matching import __version__, metrics
 from pulso_matching.config import Settings, get_settings
 from pulso_matching.examples import BATCH_EXAMPLES, MATCH_EXAMPLES
+from pulso_matching.limits import BodySizeLimitMiddleware, enforce_size_limits
 from pulso_matching.logging_config import configure_logging
 from pulso_matching.models import (
     BatchMatchRequest,
@@ -49,6 +50,9 @@ def create_app() -> FastAPI:
     )
 
     install_problem_handlers(app)
+    # Added first, so it sits innermost: request ids, access logs and latency metrics still
+    # cover the 413s it produces.
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
 
     @app.middleware("http")
     async def access_log(
@@ -90,7 +94,7 @@ def create_app() -> FastAPI:
         "/match",
         response_model=MatchResponse,
         response_model_by_alias=True,
-        responses=problem_responses(422, 504),
+        responses=problem_responses(413, 422, 504),
     )
     async def match(
         body: Annotated[MatchRequest, Body(openapi_examples=MATCH_EXAMPLES)],
@@ -98,6 +102,7 @@ def create_app() -> FastAPI:
         settings: SettingsDep,
     ) -> MatchResponse:
         """Rank pulsers for one order (best first)."""
+        enforce_size_limits("pulsers", len(body.pulsers), settings.max_pulsers)
         candidates = await run_with_timeout(
             lambda: service.rank(body.order, body.pulsers, body.limit), settings.request_timeout_ms
         )
@@ -107,7 +112,7 @@ def create_app() -> FastAPI:
         "/match/batch",
         response_model=BatchMatchResponse,
         response_model_by_alias=True,
-        responses=problem_responses(422, 504),
+        responses=problem_responses(413, 422, 504),
     )
     async def match_batch(
         body: Annotated[BatchMatchRequest, Body(openapi_examples=BATCH_EXAMPLES)],
@@ -120,6 +125,8 @@ def create_app() -> FastAPI:
         greedy and ``degraded`` is true. Past ``PULSO_REQUEST_TIMEOUT_MS`` the request fails
         with a 504 problem.
         """
+        enforce_size_limits("orders", len(body.orders), settings.max_batch_orders)
+        enforce_size_limits("pulsers", len(body.pulsers), settings.max_pulsers)
         deadline = deadline_in(settings.request_timeout_ms)
         result = await run_with_timeout(
             lambda: service.assign_batch(body.orders, body.pulsers, body.strategy, deadline),

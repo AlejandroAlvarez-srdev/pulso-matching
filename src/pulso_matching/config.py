@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     # Hard limit for a whole request; past it the client gets a 504 problem+json.
     request_timeout_ms: float = Field(default=2000.0, gt=0)
 
+    # Admission control. The request timeout only starts once the body has been parsed and
+    # validated on the event loop, so these limits are what bound that work (and the solver's).
+    # Bodies are counted as they stream in, with or without a Content-Length header.
+    max_body_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
+    max_batch_orders: int = Field(default=2000, ge=1)
+    max_pulsers: int = Field(default=5000, ge=1)
+
     log_level: str = "INFO"
     log_json: bool = True
 

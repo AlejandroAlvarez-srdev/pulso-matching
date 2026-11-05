@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from pulso_matching.limits import PayloadTooLargeError
 from pulso_matching.timeouts import RequestTimeoutError
 
 PROBLEM_JSON = "application/problem+json"
@@ -115,6 +116,21 @@ def install_problem_handlers(app: FastAPI) -> None:
                 instance=request.url.path,
             ),
             headers=dict(exc.headers) if exc.headers else None,
+        )
+
+    @app.exception_handler(PayloadTooLargeError)
+    async def on_too_large(request: Request, exc: PayloadTooLargeError) -> JSONResponse:
+        log.warning("http.payload_too_large", path=request.url.path, max_bytes=exc.max_bytes)
+        return problem_response(
+            Problem(
+                type=PROBLEM_BASE + "payload-too-large",
+                title="Request body too large",
+                status=413,
+                detail=str(exc.detail),
+                instance=request.url.path,
+            ),
+            # The rest of the body was never read; don't let the client reuse the connection.
+            headers={"connection": "close"},
         )
 
     @app.exception_handler(RequestTimeoutError)
